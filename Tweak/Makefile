@@ -1,6 +1,7 @@
 # Makefile — Theos Tweak 构建
 ARCHS = arm64 arm64e
 TARGET = iphone:clang:17.5:13.4
+NO_LDID = 1
 
 include $(THEOS)/makefiles/common.mk
 

@@ -27,28 +27,28 @@ jobs:
         run: |
           cd Tweak
           make clean 2>/dev/null || true
-          make package THEOS="$HOME/theos"
-          ls -la .theos/obj/ 2>/dev/null || find build -name "*.dylib" 2>/dev/null
+          make all THEOS="$HOME/theos"
+          echo "=== 编译产物 ==="
+          find . -name "*.dylib" -type f
+          ls -la .theos/obj/ 2>/dev/null || true
 
       - name: 收集 dylib
         run: |
           mkdir -p out
-          find . -name "Diditok.dylib" -type f
           DYLIB=$(find . -name "Diditok.dylib" -type f | head -1)
-          if [ -n "$DYLIB" ]; then
-            cp "$DYLIB" out/Diditok.dylib
-            echo "Copied $DYLIB"
-          else
+          if [ -z "$DYLIB" ]; then
             echo "ERROR: Diditok.dylib not found"
             exit 1
           fi
+          cp "$DYLIB" out/Diditok.dylib
+          echo "✅ Copied $DYLIB"
           ls -lh out/
 
       - name: 构建 insert_dylib
         run: |
           git clone https://github.com/Tatsunori/insert_dylib.git
           cd insert_dylib
-          xcodebuild -configuration Release build 2>&1 | tail -5
+          xcodebuild -configuration Release build 2>&1 | tail -10
           ls -la build/Release/insert_dylib
 
       - name: 注入 + 自签 + 重打包

@@ -61,7 +61,7 @@ jobs:
           echo "Binary: $BIN_NAME"
           BIN_PATH="$APP_DIR/$BIN_NAME"
           cp out/Diditok.dylib "$APP_DIR/Frameworks/"
-          ./insert_dylibib/build/Release/insert_dylib \
+          ./insert_dylib/build/Release/insert_dylib \
             --inplace --strip-existing \
             "@executable_path/Frameworks/Diditok.dylib" \
             "$BIN_PATH"

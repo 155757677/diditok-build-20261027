@@ -85,7 +85,7 @@ static NSDictionary *harResponseFrom(NSURLResponse *resp, NSData *body, NSTimeIn
         @try { [task removeObserver:self forKeyPath:@"state"];    } @catch (NSException *e) {}
         [g_pendingHarMap removeObjectForKey:k];
         double ms = [[NSDate date] timeIntervalSinceDate:
-                     (task.earliestBeginDate ?: task.responseDate ?: [NSDate date])] * 1000.0;
+                     (task.earliestBeginDate ?: task.response.responseDate ?: [NSDate date])] * 1000.0;
         [entry setValue:@((int)(ms + 0.5)) forKey:@"time"];
         [entry setValue:@{@"send":@0, @"wait":@((int)(ms+0.5)), @"receive":@0,
                           @"dns":@-1, @"connect":@-1, @"ssl":@-1, @"blocked":@-1}

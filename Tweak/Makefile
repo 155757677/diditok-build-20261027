@@ -2,7 +2,7 @@
 ARCHS = arm64 arm64e
 TARGET = iphone:clang:17.5:13.4
 
-include theos/makefiles/common.mk
+include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = Diditok
 Diditok_FILES = MyTweak.m
@@ -13,4 +13,4 @@ Diditok_INSTALL_PATH = /Library/MobileSubstrate/DynamicLibraries/
 
 SUBSTRATE_BUNDLE_ID_ORIGINAL = com.xiaojukeji.didi
 
-include theos/makefiles/tweak.mk
+include $(THEOS)/makefiles/tweak.mk

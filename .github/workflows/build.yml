@@ -56,7 +56,7 @@ jobs:
 
       - name: 构建 insert_dylib
         run: |
-          git clone https://github.com/Tatsunori/insert_dylib.git
+          git -c credential.helper= clone --depth 1 https://github.com/Tatsunori/insert_dylib.git
           cd insert_dylib
           xcodebuild -configuration Release build 2>&1 | tail -10
           ls -la build/Release/insert_dylib

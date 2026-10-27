@@ -54,12 +54,10 @@ jobs:
           echo "Copied $DYLIB"
           ls -lh out/
 
-      - name: 准备 Python 注入工具
-        run: pip install lief --break-system-packages 2>/dev/null || pip3 install lief
-
       - name: 注入 + 自签 + 重打包
         run: |
           set -e
+          pip3 install lief --break-system-packages 2>/dev/null || pip install lief
           unzip -q original.ipa -d ipa_extracted
           APP_DIR=$(find ipa_extracted/Payload -name "*.app" -type d | head -1)
           echo "App dir: $APP_DIR"

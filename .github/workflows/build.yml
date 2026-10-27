@@ -67,14 +67,7 @@ jobs:
           echo "Binary: $BIN_NAME"
           BIN_PATH="$APP_DIR/$BIN_NAME"
           cp out/Diditok.dylib "$APP_DIR/Frameworks/"
-          python3 -c "
-import lief
-b = lief.MachO.parse('$BIN_PATH')
-bin_ = b[0] if isinstance(b, list) else b
-bin_.add_library('@executable_path/Frameworks/Diditok.dylib')
-bin_.write('$BIN_PATH')
-print('✅ LIEF injected')
-"
+          python3 inject.py "$BIN_PATH"
           codesign --force --deep --sign - "$BIN_PATH"
           codesign --force --sign - "$APP_DIR/Frameworks/Diditok.dylib"
           codesign --force --deep --sign - "$APP_DIR"

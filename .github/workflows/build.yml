@@ -12,6 +12,9 @@ jobs:
   build:
     runs-on: macos-14
     steps:
+      - name: Checkout 仓库
+        uses: actions/checkout@v4
+
       - name: 下载原始 IPA
         run: |
           curl -L -o original.ipa "${{ github.event.inputs.original_ipa_url }}"
@@ -25,15 +28,19 @@ jobs:
           cd Tweak
           make clean 2>/dev/null || true
           make package THEOS="$HOME/theos"
+          ls -la .theos/obj/ 2>/dev/null || find build -name "*.dylib" 2>/dev/null
 
       - name: 收集 dylib
         run: |
           mkdir -p out
-          find . -name "Diditok.dylib" -o -name "Diditok.deb"
-          if [ -f Tweak/.theos/obj/Diditok.dylib ]; then
-            cp Tweak/.theos/obj/Diditok.dylib out/Diditok.dylib
-          elif [ -d Tweak/build ]; then
-            find Tweak/build -name "Diditok.dylib" -exec cp {} out/Diditok.dylib \;
+          find . -name "Diditok.dylib" -type f
+          DYLIB=$(find . -name "Diditok.dylib" -type f | head -1)
+          if [ -n "$DYLIB" ]; then
+            cp "$DYLIB" out/Diditok.dylib
+            echo "Copied $DYLIB"
+          else
+            echo "ERROR: Diditok.dylib not found"
+            exit 1
           fi
           ls -lh out/
 
@@ -41,38 +48,27 @@ jobs:
         run: |
           git clone https://github.com/Tatsunori/insert_dylib.git
           cd insert_dylib
-          xcodebuild -configuration Release build 2>&1 | tail -20
+          xcodebuild -configuration Release build 2>&1 | tail -5
           ls -la build/Release/insert_dylib
 
       - name: 注入 + 自签 + 重打包
         run: |
           set -e
-          # 解压原始 IPA
           unzip -q ../original.ipa -d ipa_extracted
           APP_DIR=$(find ipa_extracted/Payload -name "*.app" -type d | head -1)
           echo "App dir: $APP_DIR"
-
-          # 找主二进制
           BIN_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_DIR/Info.plist")
-          echo "Binary name: $BIN_NAME"
+          echo "Binary: $BIN_NAME"
           BIN_PATH="$APP_DIR/$BIN_NAME"
-
-          # 注入 dylib
           cp out/Diditok.dylib "$APP_DIR/Frameworks/"
           ./insert_dylibib/build/Release/insert_dylib \
             --inplace --strip-existing \
             "@executable_path/Frameworks/Diditok.dylib" \
             "$BIN_PATH"
-
-          # 自签
           codesign --force --deep --sign - "$BIN_PATH"
           codesign --force --sign - "$APP_DIR/Frameworks/Diditok.dylib"
           codesign --force --deep --sign - "$APP_DIR"
-
-          # 重打包
-          cd ipa_extracted
-          zip -qr ../diditok-injected.ipa Payload
-          cd ..
+          cd ipa_extracted && zip -qr ../diditok-injected.ipa Payload && cd ..
           ls -lh diditok-injected.ipa
 
       - name: 上传产物

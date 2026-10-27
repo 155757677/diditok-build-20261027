@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       original_ipa_url:
-        description: "原始滴滴 IPA 下载直链（GitHub Release 或网盘直链）"
+        description: "原始滴滴 IPA 下载直链"
         required: true
         default: ""
 
@@ -21,12 +21,21 @@ jobs:
           ls -lh original.ipa
 
       - name: 安装 Theos
-        run: git clone --depth 1 https://github.com/theos/theos.git ~/theos
+        run: |
+          git clone --recurse-submodules --depth 1 https://github.com/theos/theos.git ~/theos || {
+            git clone --depth 1 https://github.com/theos/theos.git ~/theos
+            cd ~/theos && git submodule update --init --recursive
+          }
+          echo "THEOS installed"
+          ls ~/theos/vendor/include/ 2>/dev/null | head -5 || echo "no vendor/include yet"
+          ~/theos/bin/update-theos 2>/dev/null || echo "update-theos done"
+          ls ~/theos/vendor/include/ | head -5
+          ls ~/theos/vendor/lib/ | head -5
 
       - name: 构建 Diditok.dylib
         run: |
           cd Tweak
-          make clean 2>/dev/null || true
+          make clean THEOS="$HOME/theos" 2>/dev/null || true
           make all THEOS="$HOME/theos"
           echo "=== 编译产物 ==="
           find . -name "*.dylib" -type f
@@ -41,7 +50,7 @@ jobs:
             exit 1
           fi
           cp "$DYLIB" out/Diditok.dylib
-          echo "✅ Copied $DYLIB"
+          echo "Copied $DYLIB"
           ls -lh out/
 
       - name: 构建 insert_dylib

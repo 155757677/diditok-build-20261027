@@ -61,7 +61,7 @@ static NSMutableDictionary *g_pendingHarMap;
 @interface DiditokKvo : NSObject
 + (instancetype)shared;
 @end
-@implementation DiditokKvo { @end
+@implementation DiditokKvo
 + (instancetype)shared {
     static DiditokKvo *inst; static dispatch_once_t t;
     dispatch_once(&t, ^{ inst = [DiditokKvo new]; });
@@ -111,7 +111,7 @@ static NSString *aesEncryptString(NSString *plaintext) {
     NSUInteger outSize = padded.length + 16;
     void *outBuf = malloc(outSize);
     size_t moved = 0;
-    CCCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
+    CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
              k, kAesKeyLen, iv, padded.bytes, padded.length,
              outBuf, outSize, &moved);
     NSData *ct = [NSData dataWithBytes:outBuf length:moved];
@@ -179,13 +179,27 @@ static void requirePassword(UIViewController *presenter, void (^onOk)(void)) {
 // ═══════════════════════════════════════════════════════════════════════
 // HAR 构建 + 导出
 // ═══════════════════════════════════════════════════════════════════════
+static NSString *localStatusText(int code) {
+    static NSDictionary *map;
+    static dispatch_once_t t;
+    dispatch_once(&t, ^{ map = @{
+        @200: @"OK", @201: @"Created", @204: @"No Content",
+        @301: @"Moved Permanently", @302: @"Found", @304: @"Not Modified",
+        @400: @"Bad Request", @401: @"Unauthorized", @403: @"Forbidden",
+        @404: @"Not Found", @408: @"Request Timeout", @409: @"Conflict",
+        @429: @"Too Many Requests",
+        @500: @"Internal Server Error", @502: @"Bad Gateway",
+        @503: @"Service Unavailable", @504: @"Gateway Timeout"
+    }; });
+    return map[@(code)] ?: @"";
+}
+
 static NSDictionary *harResponseFrom(NSURLResponse *resp, NSData *body, NSTimeInterval timingMs) {
     NSMutableDictionary *r = [NSMutableDictionary new];
     NSHTTPURLResponse *hr = (NSHTTPURLResponse *)resp;
     int status = hr.statusCode ?: 0;
     r[@"status"] = @(status);
-    r[@"statusText"] = NSHTTPURLResponseLocalizedStringForStatusCode(status) ?: @"";
-    r[@"httpVersion"] = @"HTTP/1.1";
+    r[@"statusText"] = localStatusText(status);
     NSMutableArray *hdrs = [NSMutableArray new];
     [hr.allHeaderFields enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *s) {
         [hdrs addObject:@{@"name": k, @"value": v}];
@@ -498,15 +512,16 @@ static void diditok_init(void) {
         g_reSs       = [NSRegularExpression regularExpressionWithPattern:@"didi-header-ssuuid:\\s*(\\S+)" options:0 error:nil];
         g_reDev      = [NSRegularExpression regularExpressionWithPattern:@"didi-header-deviceid:\\s*(\\S+)" options:0 error:nil];
         // NSURLSession
+        Class sessCls = NSClassFromString(@"NSURLSession");
         SEL s1 = NSSelectorFromString(@"dataTaskWithRequest:completionHandler:");
         SEL s2 = NSSelectorFromString(@"dataTaskWithRequest:");
-        for (SEL sel in @[s1, s2]) {
-            Method m = class_getInstanceMethod(NSClassFromString(@"NSURLSession"), sel)
-                     ?: class_getClassMethod(NSClassFromString(@"NSURLSession"), sel);
-            if (!m) continue;
-            if (sel == s1) MSHookMessageEx(m, (IMP)hookedDataTask1, &g_origDataTask1);
-            else           MSHookMessageEx(m, (IMP)hookedDataTask2, &g_origDataTask2);
-            NSLog(@"[Diditok] ✓ hooked NSURLSession.%@", NSStringFromSelector(sel));
+        if (class_getInstanceMethod(sessCls, s1)) {
+            MSHookMessageEx(sessCls, s1, (IMP)hookedDataTask1, &g_origDataTask1);
+            NSLog(@"[Diditok] ✓ hooked NSURLSession.dataTaskWithRequest:completionHandler:");
+        }
+        if (class_getInstanceMethod(sessCls, s2)) {
+            MSHookMessageEx(sessCls, s2, (IMP)hookedDataTask2, &g_origDataTask2);
+            NSLog(@"[Diditok] ✓ hooked NSURLSession.dataTaskWithRequest:");
         }
         // UserInfoCallback
         for (NSString *name in @[@"UserInfoCallback",
@@ -514,10 +529,12 @@ static void diditok_init(void) {
             Class c = NSClassFromString(name);
             if (!c) continue;
             NSLog(@"[Diditok] ✓ UserInfoCallback = %@", name);
-            Method mt = class_getInstanceMethod(c, @selector(getToken));
-            Method mp = class_getInstanceMethod(c, @selector(getPhoneNumber));
-            if (mt) MSHookMessageEx(mt, (IMP)hookedUserToken, &g_origUserToken);
-            if (mp) MSHookMessageEx(mp, (IMP)hookedUserPhone, &g_origUserPhone);
+            SEL st = @selector(getToken);
+            SEL sp = @selector(getPhoneNumber);
+            if (class_getInstanceMethod(c, st))
+                MSHookMessageEx(c, st, (IMP)hookedUserToken, &g_origUserToken);
+            if (class_getInstanceMethod(c, sp))
+                MSHookMessageEx(c, sp, (IMP)hookedUserPhone, &g_origUserPhone);
             break;
         }
         // AES 自验

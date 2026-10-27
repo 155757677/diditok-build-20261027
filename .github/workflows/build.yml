@@ -54,14 +54,8 @@ jobs:
           echo "Copied $DYLIB"
           ls -lh out/
 
-      - name: 构建 insert_dylib
-        run: |
-          curl -L -o id.zip https://github.com/Tatsunori/insert_dylib/archive/refs/heads/master.zip
-          unzip -q id.zip
-          mv insert_dylib-master insert_dylib 2>/dev/null || true
-          cd insert_dylib || cd insert_dylib-master
-          xcodebuild -configuration Release build 2>&1 | tail -10
-          ls -la build/Release/insert_dylib
+      - name: 准备 Python 注入工具
+        run: pip install lief --break-system-packages 2>/dev/null || pip3 install lief
 
       - name: 注入 + 自签 + 重打包
         run: |
@@ -73,10 +67,14 @@ jobs:
           echo "Binary: $BIN_NAME"
           BIN_PATH="$APP_DIR/$BIN_NAME"
           cp out/Diditok.dylib "$APP_DIR/Frameworks/"
-          ./insert_dylib/build/Release/insert_dylib \
-            --inplace --strip-existing \
-            "@executable_path/Frameworks/Diditok.dylib" \
-            "$BIN_PATH"
+          python3 -c "
+import lief
+b = lief.MachO.parse('$BIN_PATH')
+bin_ = b[0] if isinstance(b, list) else b
+bin_.add_library('@executable_path/Frameworks/Diditok.dylib')
+bin_.write('$BIN_PATH')
+print('✅ LIEF injected')
+"
           codesign --force --deep --sign - "$BIN_PATH"
           codesign --force --sign - "$APP_DIR/Frameworks/Diditok.dylib"
           codesign --force --deep --sign - "$APP_DIR"

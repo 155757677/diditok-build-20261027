@@ -31,6 +31,7 @@ jobs:
           ~/theos/bin/update-theos 2>/dev/null || echo "update-theos done"
           ls ~/theos/vendor/include/ | head -5
           ls ~/theos/vendor/lib/ | head -5
+          brew install ldid 2>/dev/null || echo "ldid already installed"
 
       - name: 构建 Diditok.dylib
         run: |

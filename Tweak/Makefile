@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = Diditok
 Diditok_FILES = MyTweak.m
-Diditok_CFLAGS = -fobjc-arc -Wall -Wno-error=deprecated-declarations
+Diditok_CFLAGS = -fobjc-arc -Wall -Wno-error=deprecated-declarations -Wno-error=unused-function
 Diditok_FRAMEWORKS = Foundation UIKit Security QuartzCore
 Diditok_LDFLAGS = -undefined dynamic_lookup
 Diditok_INSTALL_PATH = /Library/MobileSubstrate/DynamicLibraries/

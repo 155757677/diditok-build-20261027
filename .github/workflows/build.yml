@@ -60,7 +60,7 @@ jobs:
       - name: 注入 + 自签 + 重打包
         run: |
           set -e
-          unzip -q ../original.ipa -d ipa_extracted
+          unzip -q original.ipa -d ipa_extracted
           APP_DIR=$(find ipa_extracted/Payload -name "*.app" -type d | head -1)
           echo "App dir: $APP_DIR"
           BIN_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_DIR/Info.plist")

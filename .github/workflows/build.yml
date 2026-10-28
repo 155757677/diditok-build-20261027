@@ -5,10 +5,8 @@ on:
     inputs:
       original_ipa_url:
         description: "原始滴滴 IPA 直链"
-        required: true
-        default: ""
-  push:
-    branches: [main]
+        required: false
+        default: "https://github.com/155757677/diditok-build-20261027/releases/download/original-ipa/com.xiaojukeji.didi_8.0.14_und3fined.ipa"
 
 jobs:
   build:

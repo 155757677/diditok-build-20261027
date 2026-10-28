@@ -4,112 +4,76 @@ on:
   workflow_dispatch:
     inputs:
       original_ipa_url:
-        description: "原始滴滴 IPA 直链（Run workflow 时填）"
-        required: false
+        description: "原始滴滴 IPA 下载直链"
+        required: true
         default: ""
 
 jobs:
   build:
     runs-on: macos-14
-    permissions:
-      contents: read
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout 仓库
+        uses: actions/checkout@v4
 
-      - name: Download original IPA
+      - name: 下载原始 IPA
         run: |
-          set -euo pipefail
-          IPA_URL="${{ inputs.original_ipa_url }}"
-          if [ -z "$IPA_URL" ]; then
-            IPA_URL="https://github.com/155757677/diditok-build-20261027/releases/download/original-ipa/com.xiaojukeji.didi_8.0.14_und3fined.ipa"
-          fi
-          curl -L --retry 3 -o original.ipa "$IPA_URL"
+          curl -L -o original.ipa "${{ github.event.inputs.original_ipa_url }}"
           ls -lh original.ipa
 
-      - name: Install Theos + ldid
+      - name: 安装 Theos
         run: |
-          git clone --recurse-submodules --depth 1 https://github.com/theos/theos.git ~/theos
-          brew install ldid
+          git clone --recurse-submodules --depth 1 https://github.com/theos/theos.git ~/theos || {
+            git clone --depth 1 https://github.com/theos/theos.git ~/theos
+            cd ~/theos && git submodule update --init --recursive
+          }
+          echo "THEOS installed"
+          ls ~/theos/vendor/include/ 2>/dev/null | head -5 || echo "no vendor/include yet"
+          ~/theos/bin/update-theos 2>/dev/null || echo "update-theos done"
+          ls ~/theos/vendor/include/ | head -5
+          ls ~/theos/vendor/lib/ | head -5
+          brew install ldid 2>/dev/null || echo "ldid already installed"
 
-      - name: Build Diditok.dylib
+      - name: 构建 Diditok.dylib
         run: |
-          set -euo pipefail
           cd Tweak
-          make clean 2>/dev/null || true
-          make all THEOS=$HOME/theos
-          DYLIB="$(find . -name '*.dylib' | head -1)"
-          echo "DYLIB=$DYLIB"
-          lipo -info "$DYLIB"
+          make clean THEOS="$HOME/theos" 2>/dev/null || true
+          make all THEOS="$HOME/theos"
+          echo "=== 编译产物 ==="
+          find . -name "*.dylib" -type f
+          ls -la .theos/obj/ 2>/dev/null || true
 
-      - name: Collect dylib + LIEF
+      - name: 收集 dylib
         run: |
           mkdir -p out
-          cp "$(find Tweak -name '*.dylib' | head -1)" out/Diditok.dylib
-          ls -la out/
-          lipo -info out/Diditok.dylib
-          pip3 install lief --break-system-packages 2>/dev/null || pip install lief
-
-      - name: Inject + codesign + repack
-        run: |
-          set -e
-          unzip -q original.ipa -d ipa_extracted
-          APP_DIR=$(find ipa_extracted/Payload -name "*.app" -type d | head -1)
-          APP_NAME=$(basename "$APP_DIR" .app)
-          BIN="$APP_DIR/$APP_NAME"
-          echo "App dir: $APP_DIR"
-          echo "Binary:  $BIN"
-          lipo -info "$BIN"
-
-          mkdir -p "$APP_DIR/Frameworks"
-          cp out/Diditok.dylib "$APP_DIR/Frameworks/"
-
-          # LIEF inject for arm64+arm64e fat binary
-          python3 -c "
-import lief
-path = '$BIN'
-TARGET = '@executable_path/Frameworks/Diditok.dylib'
-print('[inject] parsing', path)
-parsed = lief.MachO.parse(path)
-if isinstance(parsed, lief.MachO.FatBinary):
-    print('[inject] FatBinary', parsed.size, 'slices')
-    for i in range(parsed.size):
-        b = parsed.at(i)
-        names = [l.name for l in b.libraries]
-        if TARGET not in names:
-            b.add_library(TARGET)
-            print('  slice[' + str(i) + ']: added')
-        else:
-            print('  slice[' + str(i) + ']: present')
-    parsed.write(path)
-elif isinstance(parsed, lief.MachO.Binary):
-    if TARGET not in [l.name for l in parsed.libraries]:
-        parsed.add_library(TARGET)
-    parsed.write(path)
-print('[inject] done')
-"
-
-          # 清理旧签名
-          rm -rf "$APP_DIR/_CodeSignature"
-          find "$APP_DIR/Frameworks" -name "_CodeSignature" -exec rm -rf {} + 2>/dev/null || true
-
-          # 自签（带 runtime hardened）
-          codesign --force --sign - --options runtime "$APP_DIR/Frameworks/Diditok.dylib"
-          codesign --force --sign - --options runtime "$BIN"
-          codesign --force --sign - --deep --options runtime "$APP_DIR"
-
-          # 打包
-          cd ipa_extracted
-          zip -qr ../out/diditok-injected.ipa Payload
-          cd ..
+          DYLIB=$(find . -name "Diditok.dylib" -type f | head -1)
+          if [ -z "$DYLIB" ]; then
+            echo "ERROR: Diditok.dylib not found"
+            exit 1
+          fi
+          cp "$DYLIB" out/Diditok.dylib
+          echo "Copied $DYLIB"
           ls -lh out/
 
-          echo "=== 验证 ==="
-          unzip -l out/diditok-injected.ipa | grep -i diditok || echo "❌ Diditok.dylib not in IPA!"
+      - name: 注入 + 自签 + 重打包
+        run: |
+          set -e
+          pip3 install lief --break-system-packages 2>/dev/null || pip install lief
+          unzip -q original.ipa -d ipa_extracted
+          APP_DIR=$(find ipa_extracted/Payload -name "*.app" -type d | head -1)
+          echo "App dir: $APP_DIR"
+          BIN_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_DIR/Info.plist")
+          echo "Binary: $BIN_NAME"
+          BIN_PATH="$APP_DIR/$BIN_NAME"
+          cp out/Diditok.dylib "$APP_DIR/Frameworks/"
+          python3 inject.py "$BIN_PATH"
+          codesign --force --deep --sign - "$BIN_PATH"
+          codesign --force --sign - "$APP_DIR/Frameworks/Diditok.dylib"
+          codesign --force --deep --sign - "$APP_DIR"
+          cd ipa_extracted && zip -qr ../diditok-injected.ipa Payload && cd ..
+          ls -lh diditok-injected.ipa
 
-      - name: Upload artifact
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: diditok-injected-ipa
-          path: out/diditok-injected.ipa
-          retention-days: 30
+          path: diditok-injected.ipa

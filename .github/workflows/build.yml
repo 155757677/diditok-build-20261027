@@ -1,7 +1,8 @@
 name: Build Diditok IPA
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
 
 jobs:
   build:
@@ -13,13 +14,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: 下载原始 IPA
-        env:
-          IPA_URL: ${{ github.event.inputs.original_ipa_url }}
         run: |
           set -e
-          if [ -z "$IPA_URL" ]; then
-            IPA_URL="https://github.com/155757677/diditok-build-20261027/releases/download/original-ipa/com.xiaojukeji.didi_8.0.14_und3fined.ipa"
-          fi
+          IPA_URL="https://github.com/155757677/diditok-build-20261027/releases/download/original-ipa/com.xiaojukeji.didi_8.0.14_und3fined.ipa"
           curl -L --retry 3 -o original.ipa "$IPA_URL"
           ls -lh original.ipa
 
@@ -65,18 +62,18 @@ jobs:
 import lief
 path = '$BIN'
 TARGET = '@executable_path/Frameworks/Diditok.dylib'
-print(f'[inject] parsing {path}')
+print('[inject] parsing', path)
 parsed = lief.MachO.parse(path)
 if isinstance(parsed, lief.MachO.FatBinary):
-    print(f'[inject] FatBinary {parsed.size} slices')
+    print('[inject] FatBinary', parsed.size, 'slices')
     for i in range(parsed.size):
         b = parsed.at(i)
         names = [l.name for l in b.libraries]
         if TARGET not in names:
             b.add_library(TARGET)
-            print(f'  slice[{i}]: added')
+            print('  slice[' + str(i) + ']: added')
         else:
-            print(f'  slice[{i}]: present')
+            print('  slice[' + str(i) + ']: present')
     parsed.write(path)
 elif isinstance(parsed, lief.MachO.Binary):
     if TARGET not in [l.name for l in parsed.libraries]:

@@ -1,0 +1,65 @@
+name: Build Tweak (Linux)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装工具链
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld git curl unzip zip > /dev/null
+          echo "--- clang ---"; clang --version | head -2
+          echo "--- ld64 ---"; ls /usr/bin | grep -i ld64 || echo "no ld64 in /usr/bin"
+          which ld64.lld || echo "ld64.lld missing"
+          which ld.lld || echo "ld.lld missing"
+
+      - name: 拉 iOS SDK
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git ~/sdks
+          cd ~/sdks
+          git sparse-checkout set --no-cone 'iPhoneOS*.sdk'
+          ls -d ~/sdks/iPhoneOS*.sdk
+          SDK=$(ls -d ~/sdks/iPhoneOS*.sdk | sort -V | tail -1)
+          echo "SDK=$SDK"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+          echo "--- 检查 headers ---"
+          ls "$SDK/System/Library/Frameworks/Foundation.framework/" | head
+          ls "$SDK/usr/include/objc/" 2>/dev/null | head
+
+      - name: 拿 substrate.h
+        run: |
+          mkdir -p inc
+          for u in \
+            https://raw.githubusercontent.com/theos/headers/master/substrate.h \
+            https://raw.githubusercontent.com/theos/headers/master/include/substrate.h ; do
+            if curl -fsSL -o inc/substrate.h "$u"; then echo "OK $u"; break; fi
+            echo "miss $u"
+          done
+          wc -l inc/substrate.h && head -5 inc/substrate.h
+
+      - name: 编译 dylib
+        run: |
+          set -o pipefail
+          mkdir -p out
+          clang -target arm64-apple-ios13.0 \
+            -isysroot "$SDK" \
+            -dynamiclib -O2 -fobjc-arc \
+            -Wno-everything \
+            -Iinc \
+            -framework Foundation -framework UIKit -framework Security -framework QuartzCore \
+            -undefined dynamic_lookup \
+            -fuse-ld=lld \
+            -o out/Diditok.dylib Tweak/MyTweak.m 2>&1 | tail -50
+          ls -lh out/
+          file out/Diditok.dylib || true
+
+      - name: 上传 dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: diditok-dylib
+          path: out/Diditok.dylib

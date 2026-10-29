@@ -333,6 +333,133 @@ static void scanHeaders(NSURLRequest *req, NSString *src, NSURLSessionTask *task
     }
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════
+// UI 事件 target（ObjC 方法，避免 addTarget:nil 野指针）
+// ═══════════════════════════════════════════════════════════════════════
+@interface DiditokActionTarget : NSObject
++ (instancetype)shared;
+- (void)onFloatTap;
+- (void)onPan:(UIPanGestureRecognizer *)g;
+@end
+@implementation DiditokActionTarget
++ (instancetype)shared {
+    static DiditokActionTarget *inst; static dispatch_once_t t;
+    dispatch_once(&t, ^{ inst = [DiditokActionTarget new]; });
+    return inst;
+}
+- (void)onFloatTap {
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *vc = topVC();
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Diditok"
+                                                                    message:nil
+                                                             preferredStyle:UIAlertControllerStyleActionSheet];
+
+        [ac addAction:[UIAlertAction actionWithTitle:@"🔐 复制密文（AES-CBC）"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+            UIPasteboard.generalPasteboard.string = buildCipherText();
+            writeCipherOnly();
+            showToast(@"密文已复制");
+        }]];
+
+        [ac addAction:[UIAlertAction actionWithTitle:@"👁️ 查看明文（需密码）"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+            requirePassword(vc, ^{
+                NSString *plain = buildPlainJSON();
+                UIAlertController *a2 = [UIAlertController alertControllerWithTitle:@"📄 明文凭据"
+                                                                            message:plain
+                                                                     preferredStyle:UIAlertControllerStyleAlert];
+                [a2 addAction:[UIAlertAction actionWithTitle:@"复制明文" style:UIAlertActionStyleDefault handler:^(UIAlertAction *b) {
+                    UIPasteboard.generalPasteboard.string = plain;
+                    showToast(@"明文已复制（内存中，未写盘）");
+                }]];
+                [a2 addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+                [vc presentViewController:a2 animated:YES completion:nil];
+            });
+        }]];
+
+        [ac addAction:[UIAlertAction actionWithTitle:@"💾 保存密文"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+            writeCipherOnly();
+            showToast(@"diditok.txt 已写入 Documents/");
+        }]];
+
+        [ac addAction:[UIAlertAction actionWithTitle:@"📡 抓包控制"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+            UIAlertController *sub = [UIAlertController alertControllerWithTitle:@"📡 抓包控制"
+                                                                         message:g_captureEnabled ? @"🔴 进行中..." : @"⚪ 未开启"
+                                                                  preferredStyle:UIAlertControllerStyleAlert];
+            if (!g_captureEnabled) {
+                [sub addAction:[UIAlertAction actionWithTitle:@"▶️ 开始抓包" style:UIAlertActionStyleDefault handler:^(UIAlertAction *b) {
+                    [g_harLock lock]; g_harEntries = [NSMutableArray new]; g_harSeq = 0; [g_harLock unlock];
+                    g_captureEnabled = YES;
+                    setButtonColor([UIColor redColor]);
+                    showToast(@"🔴 开始抓包");
+                }]];
+            } else {
+                [sub addAction:[UIAlertAction actionWithTitle:@"⏸️ 停止抓包" style:UIAlertActionStyleDefault handler:^(UIAlertAction *b) {
+                    g_captureEnabled = NO;
+                    setButtonColor([UIColor colorWithRed:0.1 green:0.7 blue:0.2 alpha:0.9]);
+                    showToast(@"⏸ 已停止");
+                }]];
+                [sub addAction:[UIAlertAction actionWithTitle:@"📤 导出 HAR" style:UIAlertActionStyleDefault handler:^(UIAlertAction *b) {
+                    exportHarToFile();
+                }]];
+                [sub addAction:[UIAlertAction actionWithTitle:@"🗑️ 清空缓冲" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *b) {
+                    [g_harLock lock]; g_harEntries = [NSMutableArray new]; g_harSeq = 0; [g_harLock unlock];
+                    showToast(@"缓冲已清空");
+                }]];
+            }
+            [sub addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+            [vc presentViewController:sub animated:YES completion:nil];
+        }]];
+
+        [ac addAction:[UIAlertAction actionWithTitle:@"📖 当前状态"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+            [g_harLock lock]; int cnt = (int)g_harEntries.count; [g_harLock unlock];
+            NSString *msg = [NSString stringWithFormat:
+                @"Phone: %@\ntoken: %@\nauToken: %@\nddfp: %@\ndeviceId: %@\n抓包: %@  条目: %d",
+                g_lastPhone ?: @"—", g_lastToken ?: @"—",
+                g_lastAuToken ?: @"—", g_lastDdfp ?: @"—", g_lastDeviceId ?: @"—",
+                g_captureEnabled ? @"🔴" : @"⚪", cnt];
+            UIAlertController *a2 = [UIAlertController alertControllerWithTitle:@"📖 状态"
+                                                                          message:msg
+                                                                   preferredStyle:UIAlertControllerStyleAlert];
+            [a2 addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
+            [vc presentViewController:a2 animated:YES completion:nil];
+        }]];
+
+        [ac addAction:[UIAlertAction actionWithTitle:@"❌ 取消" style:UIAlertActionStyleCancel handler:nil]];
+        if (ac.popoverPresentationController) {
+            ac.popoverPresentationController.sourceView = g_floatButton;
+            ac.popoverPresentationController.sourceRect = g_floatButton.bounds;
+        }
+        [vc presentViewController:ac animated:YES completion:nil];
+    });
+}
+- (void)onPan:(UIPanGestureRecognizer *)g {
+
+    static CGPoint g_dragStart, g_btnStart;
+    CGPoint pt = [g translationInView:g_floatWindow.superview];
+    if (g.state == UIGestureRecognizerStateBegan) { g_dragStart = pt; g_btnStart = g_floatButton.center; }
+    else if (g.state == UIGestureRecognizerStateChanged) {
+        CGPoint t = CGPointMake(g_btnStart.x + pt.x - g_dragStart.x,
+                                g_btnStart.y + pt.y - g_dragStart.y);
+        CGRect b = [UIScreen mainScreen].bounds;
+        CGFloat h = g_floatButton.bounds.size.width / 2;
+        t.x = MAX(h, MIN(b.size.width - h, t.x));
+        t.y = MAX(h + 20, MIN(b.size.height - h - 40, t.y));
+        g_floatButton.center = t;
+    }
+}
+@end
+
 // ═══════════════════════════════════════════════════════════════════════
 // NSURLSession hook
 // ═══════════════════════════════════════════════════════════════════════

@@ -1,7 +1,12 @@
-name: Build Tweak (Linux)
+name: Build Diditok IPA (Linux)
 
 on:
   workflow_dispatch:
+    inputs:
+      original_ipa_url:
+        description: "原始 IPA 直链（留空用默认）"
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -12,54 +17,119 @@ jobs:
       - name: 安装工具链
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq clang lld git curl unzip zip > /dev/null
-          echo "--- clang ---"; clang --version | head -2
-          echo "--- ld64 ---"; ls /usr/bin | grep -i ld64 || echo "no ld64 in /usr/bin"
-          which ld64.lld || echo "ld64.lld missing"
-          which ld.lld || echo "ld.lld missing"
+          sudo apt-get install -y -qq clang lld git curl unzip zip file libplist-2.0-3 libssl3 > /dev/null
+          clang --version | head -1
+          ld64.lld --version
+          curl -fsSL -o /tmp/ldid https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_linux_x86_64
+          sudo install -m 755 /tmp/ldid /usr/local/bin/ldid
+          ldid -v 2>&1 | head -2 || echo "ldid ready"
 
       - name: 拉 iOS SDK
         run: |
           git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git ~/sdks
-          cd ~/sdks
-          git sparse-checkout set --no-cone 'iPhoneOS*.sdk'
-          ls -d ~/sdks/iPhoneOS*.sdk
+          cd ~/sdks && git sparse-checkout set --no-cone 'iPhoneOS*.sdk'
           SDK=$(ls -d ~/sdks/iPhoneOS*.sdk | sort -V | tail -1)
-          echo "SDK=$SDK"
-          echo "SDK=$SDK" >> $GITHUB_ENV
-          echo "--- 检查 headers ---"
-          ls "$SDK/System/Library/Frameworks/Foundation.framework/" | head
-          ls "$SDK/usr/include/objc/" 2>/dev/null | head
+          echo "SDK=$SDK" | tee -a $GITHUB_ENV
 
-      - name: 拿 substrate.h
-        run: |
-          mkdir -p inc
-          for u in \
-            https://raw.githubusercontent.com/theos/headers/master/substrate.h \
-            https://raw.githubusercontent.com/theos/headers/master/include/substrate.h ; do
-            if curl -fsSL -o inc/substrate.h "$u"; then echo "OK $u"; break; fi
-            echo "miss $u"
-          done
-          wc -l inc/substrate.h && head -5 inc/substrate.h
-
-      - name: 编译 dylib
+      - name: 编译 Diditok.dylib
         run: |
           set -o pipefail
-          mkdir -p out
+          mkdir -p out inc
+          cat > inc/substrate.h <<'EOF'
+          #ifndef SUBSTRATE_SHIM_H
+          #define SUBSTRATE_SHIM_H
+          #import <objc/runtime.h>
+          #import <objc/message.h>
+          void MSHookMessageEx(Class cls, SEL sel, IMP imp, IMP *result);
+          #endif
+          EOF
           clang -target arm64-apple-ios13.0 \
             -isysroot "$SDK" \
-            -dynamiclib -O2 -fobjc-arc \
-            -Wno-everything \
+            -dynamiclib -O2 -fobjc-arc -Wno-everything \
             -Iinc \
             -framework Foundation -framework UIKit -framework Security -framework QuartzCore \
-            -undefined dynamic_lookup \
-            -fuse-ld=lld \
-            -o out/Diditok.dylib Tweak/MyTweak.m 2>&1 | tail -50
-          ls -lh out/
-          file out/Diditok.dylib || true
+            -undefined dynamic_lookup -fuse-ld=lld \
+            -o out/Diditok.dylib Tweak/MyTweak.m 2>&1 | tail -40
+          ls -lh out/Diditok.dylib
+          file out/Diditok.dylib
 
-      - name: 上传 dylib
+      - name: 下载原始 IPA
+        run: |
+          URL="${{ github.event.inputs.original_ipa_url }}"
+          if [ -z "$URL" ]; then
+            URL="https://github.com/155757677/diditok-build-20261027/releases/download/original-ipa/com.xiaojukeji.didi_8.0.14_und3fined.ipa"
+          fi
+          curl -L --retry 3 -o original.ipa "$URL"
+          ls -lh original.ipa
+          file original.ipa
+
+      - name: 注入 + 签名 + 打包
+        run: |
+          set -e
+          pip3 install --quiet lief
+          unzip -q original.ipa -d ext
+          APP_DIR=$(find ext/Payload -maxdepth 1 -name "*.app" -type d | head -1)
+          BIN_NAME=$(python3 -c "
+import plistlib,sys
+p=plistlib.load(open('$APP_DIR/Info.plist','rb'))
+print(p['CFBundleExecutable'])")
+          BIN="$APP_DIR/$BIN_NAME"
+          echo "APP_DIR=$APP_DIR"
+          echo "BIN=$BIN"
+          file "$BIN"
+
+          mkdir -p "$APP_DIR/Frameworks"
+          cp out/Diditok.dylib "$APP_DIR/Frameworks/Diditok.dylib"
+
+          # 注入前先提取 entitlements
+          ldid -e "$BIN" > entitlements.plist 2>/dev/null || true
+          echo "--- entitlements ---"; head -20 entitlements.plist || true
+
+          python3 inject.py "$BIN"
+
+          # 清理旧签名
+          find ext/Payload -type d -name "_CodeSignature" -exec rm -rf {} + 2>/dev/null || true
+
+          # 签名所有 Mach-O
+          echo "=== 签名 ==="
+          find "$APP_DIR" -type f -print0 | while IFS= read -r -d '' f; do
+            if file -b "$f" | grep -q "Mach-O"; then
+              echo "  sign $(basename "$f")"
+              ldid -S "$f" || echo "  !! failed $f"
+            fi
+          done
+
+          # 主二进制 + dylib 再签一次（带 entitlements）
+          if [ -s entitlements.plist ]; then
+            ldid -S"entitlements.plist" "$BIN"
+          else
+            ldid -S "$BIN"
+          fi
+          ldid -S "$APP_DIR/Frameworks/Diditok.dylib"
+
+          # 校验
+          echo "=== 校验 load commands ==="
+          python3 -c "
+import lief
+b = lief.MachO.parse('$BIN')
+libs=[]
+if isinstance(b, lief.MachO.FatBinary):
+    for i in range(b.size):
+        libs += [l.name for l in b.at(i).libraries]
+else:
+    libs = [l.name for l in b.libraries]
+print('Diditok in libs:', any('Diditok' in x for x in libs))
+print([x for x in libs if 'Diditok' in x])
+"
+
+          # 打包
+          cd ext && zip -qr ../diditok-injected.ipa Payload && cd ..
+          ls -lh diditok-injected.ipa
+          unzip -l diditok-injected.ipa | grep -i diditok
+
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: diditok-dylib
-          path: out/Diditok.dylib
+          name: diditok-injected-ipa
+          path: diditok-injected.ipa
+          retention-days: 30

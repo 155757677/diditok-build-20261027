@@ -58,7 +58,7 @@ static IMP g_origUserPhone = NULL;
 
 static NSMutableDictionary *g_pendingHarMap;
 
-// ═══════════════════════════════════════════════════════════════════════
+static id g_launchObserver = nil;// ═══════════════════════════════════════════════════════════════════════
 // HAR response forward declaration
 // ═══════════════════════════════════════════════════════════════════════
 static NSDictionary *harResponseFrom(NSURLResponse *resp, NSData *body, NSTimeInterval timingMs);
@@ -338,13 +338,23 @@ static void scanHeaders(NSURLRequest *req, NSString *src, NSURLSessionTask *task
 // ═══════════════════════════════════════════════════════════════════════
 static id hookedDataTask1(id self, SEL _cmd, NSURLRequest *req, id handler) {
     typedef id (*o_t)(id, SEL, NSURLRequest *, id);
-    id task = ((o_t)g_origDataTask1)(self, _cmd, req, handler);
+    id task = nil;
+    if (g_origDataTask1) {
+        task = ((o_t)g_origDataTask1)(self, _cmd, req, handler);
+    } else {
+        task = ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, req, handler);
+    }
     scanHeaders(req, @"NSURLSession#dataTaskWithRequest:completionHandler:", task);
     return task;
 }
 static id hookedDataTask2(id self, SEL _cmd, NSURLRequest *req) {
     typedef id (*o_t)(id, SEL, NSURLRequest *);
-    id task = ((o_t)g_origDataTask2)(self, _cmd, req);
+    id task = nil;
+    if (g_origDataTask2) {
+        task = ((o_t)g_origDataTask2)(self, _cmd, req);
+    } else {
+        task = ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, req);
+    }
     scanHeaders(req, @"NSURLSession#dataTaskWithRequest:", task);
     return task;
 }
@@ -363,20 +373,6 @@ static NSString* hookedUserPhone(id self, SEL _cmd) {
 // ═══════════════════════════════════════════════════════════════════════
 // 悬浮 UI
 // ═══════════════════════════════════════════════════════════════════════
-static void onPan(UIPanGestureRecognizer *g) {
-    static CGPoint g_dragStart, g_btnStart;
-    CGPoint pt = [g translationInView:g_floatWindow.superview];
-    if (g.state == UIGestureRecognizerStateBegan) { g_dragStart = pt; g_btnStart = g_floatButton.center; }
-    else if (g.state == UIGestureRecognizerStateChanged) {
-        CGPoint t = CGPointMake(g_btnStart.x + pt.x - g_dragStart.x,
-                                g_btnStart.y + pt.y - g_dragStart.y);
-        CGRect b = [UIScreen mainScreen].bounds;
-        CGFloat h = g_floatButton.bounds.size.width / 2;
-        t.x = MAX(h, MIN(b.size.width - h, t.x));
-        t.y = MAX(h + 20, MIN(b.size.height - h - 40, t.y));
-        g_floatButton.center = t;
-    }
-}
 
 static UIViewController *topVC(void) {
     UIWindow *kw = [UIApplication sharedApplication].keyWindow;
@@ -385,100 +381,6 @@ static UIViewController *topVC(void) {
     return vc;
 }
 
-static void onFloatTap(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *vc = topVC();
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Diditok"
-                                                                    message:nil
-                                                             preferredStyle:UIAlertControllerStyleActionSheet];
-
-        [ac addAction:[UIAlertAction actionWithTitle:@"🔐 复制密文（AES-CBC）"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-            UIPasteboard.generalPasteboard.string = buildCipherText();
-            writeCipherOnly();
-            showToast(@"密文已复制");
-        }]];
-
-        [ac addAction:[UIAlertAction actionWithTitle:@"👁️ 查看明文（需密码）"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-            requirePassword(vc, ^{
-                NSString *plain = buildPlainJSON();
-                UIAlertController *a2 = [UIAlertController alertControllerWithTitle:@"📄 明文凭据"
-                                                                            message:plain
-                                                                     preferredStyle:UIAlertControllerStyleAlert];
-                [a2 addAction:[UIAlertAction actionWithTitle:@"复制明文" style:UIAlertActionStyleDefault handler:^(UIAlertAction *b) {
-                    UIPasteboard.generalPasteboard.string = plain;
-                    showToast(@"明文已复制（内存中，未写盘）");
-                }]];
-                [a2 addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
-                [vc presentViewController:a2 animated:YES completion:nil];
-            });
-        }]];
-
-        [ac addAction:[UIAlertAction actionWithTitle:@"💾 保存密文"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-            writeCipherOnly();
-            showToast(@"diditok.txt 已写入 Documents/");
-        }]];
-
-        [ac addAction:[UIAlertAction actionWithTitle:@"📡 抓包控制"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-            UIAlertController *sub = [UIAlertController alertControllerWithTitle:@"📡 抓包控制"
-                                                                         message:g_captureEnabled ? @"🔴 进行中..." : @"⚪ 未开启"
-                                                                  preferredStyle:UIAlertControllerStyleAlert];
-            if (!g_captureEnabled) {
-                [sub addAction:[UIAlertAction actionWithTitle:@"▶️ 开始抓包" style:UIAlertActionStyleDefault handler:^(UIAlertAction *b) {
-                    [g_harLock lock]; g_harEntries = [NSMutableArray new]; g_harSeq = 0; [g_harLock unlock];
-                    g_captureEnabled = YES;
-                    setButtonColor([UIColor redColor]);
-                    showToast(@"🔴 开始抓包");
-                }]];
-            } else {
-                [sub addAction:[UIAlertAction actionWithTitle:@"⏸️ 停止抓包" style:UIAlertActionStyleDefault handler:^(UIAlertAction *b) {
-                    g_captureEnabled = NO;
-                    setButtonColor([UIColor colorWithRed:0.1 green:0.7 blue:0.2 alpha:0.9]);
-                    showToast(@"⏸ 已停止");
-                }]];
-                [sub addAction:[UIAlertAction actionWithTitle:@"📤 导出 HAR" style:UIAlertActionStyleDefault handler:^(UIAlertAction *b) {
-                    exportHarToFile();
-                }]];
-                [sub addAction:[UIAlertAction actionWithTitle:@"🗑️ 清空缓冲" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *b) {
-                    [g_harLock lock]; g_harEntries = [NSMutableArray new]; g_harSeq = 0; [g_harLock unlock];
-                    showToast(@"缓冲已清空");
-                }]];
-            }
-            [sub addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-            [vc presentViewController:sub animated:YES completion:nil];
-        }]];
-
-        [ac addAction:[UIAlertAction actionWithTitle:@"📖 当前状态"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-            [g_harLock lock]; int cnt = (int)g_harEntries.count; [g_harLock unlock];
-            NSString *msg = [NSString stringWithFormat:
-                @"Phone: %@\ntoken: %@\nauToken: %@\nddfp: %@\ndeviceId: %@\n抓包: %@  条目: %d",
-                g_lastPhone ?: @"—", g_lastToken ?: @"—",
-                g_lastAuToken ?: @"—", g_lastDdfp ?: @"—", g_lastDeviceId ?: @"—",
-                g_captureEnabled ? @"🔴" : @"⚪", cnt];
-            UIAlertController *a2 = [UIAlertController alertControllerWithTitle:@"📖 状态"
-                                                                          message:msg
-                                                                   preferredStyle:UIAlertControllerStyleAlert];
-            [a2 addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
-            [vc presentViewController:a2 animated:YES completion:nil];
-        }]];
-
-        [ac addAction:[UIAlertAction actionWithTitle:@"❌ 取消" style:UIAlertActionStyleCancel handler:nil]];
-        if (ac.popoverPresentationController) {
-            ac.popoverPresentationController.sourceView = g_floatButton;
-            ac.popoverPresentationController.sourceRect = g_floatButton.bounds;
-        }
-        [vc presentViewController:ac animated:YES completion:nil];
-    });
-}
 
 static void setupFloatUI(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -501,8 +403,8 @@ static void setupFloatUI(void) {
         [g_floatButton setTitle:@"T" forState:UIControlStateNormal];
         [g_floatButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         g_floatButton.titleLabel.font = [UIFont boldSystemFontOfSize:28];
-        [g_floatButton addTarget:nil action:@selector(onFloatTap) forControlEvents:UIControlEventTouchUpInside];
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:nil action:@selector(onPan:)];
+        [g_floatButton addTarget:[DiditokActionTarget shared] action:@selector(onFloatTap) forControlEvents:UIControlEventTouchUpInside];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[DiditokActionTarget shared] action:@selector(onPan:)];
         [g_floatButton addGestureRecognizer:pan];
         [g_floatWindow addSubview:g_floatButton];
 
@@ -576,7 +478,7 @@ static void diditok_init(void) {
             NSLog(@"[Diditok] ✗ AES self-test FAILED: %@", e);
         }
 
-        // ✅ 修 4: UI 延迟 setup — 等 App 完全启动后再建 UIWindow
+        // ✅ 修 4: UI 延迟 setup — 等 App 完全启动后再建 UIWindowg_launchObserver = 
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]

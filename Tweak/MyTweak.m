@@ -334,6 +334,7 @@ static void scanHeaders(NSURLRequest *req, NSString *src, NSURLSessionTask *task
 }
 
 
+static UIViewController *topVC(void);
 // ═══════════════════════════════════════════════════════════════════════
 // UI 事件 target（ObjC 方法，避免 addTarget:nil 野指针）
 // ═══════════════════════════════════════════════════════════════════════

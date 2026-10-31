@@ -421,7 +421,9 @@ static void scanResponseBodyForPhone(NSData *data) {
                               @"user_phone", @"passenger_phone"], 0);
         if (![v isKindOfClass:[NSString class]]) return;
         NSString *s = v;
-        if ([rePhone firstMatchInString:s options:0 range:NSMakeRange(0, s.length)].length != 0) {
+        NSTextCheckingResult *m = [rePhone firstMatchInString:s options:0
+                                                        range:NSMakeRange(0, s.length)];
+        if (m && m.range.length > 0) {
             g_lastPhone = s;
             onCredsFound();
         }

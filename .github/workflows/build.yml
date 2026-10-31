@@ -54,12 +54,38 @@ jobs:
           BIN_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_DIR/Info.plist")
           echo "Binary: $BIN_NAME"
           BIN_PATH="$APP_DIR/$BIN_NAME"
+
+          # ⚠️ 关键：必须在 LIEF 改动前，把主二进制的原始 entitlements 备份出来。
+          # 之前用 codesign --force --deep --sign - 重签把 entitlements 全部抹掉了
+          # （keychain-access-groups / application-identifier / aps-environment 全没了），
+          # 滴滴的 WSG 安全 SDK 拿不到这些就直接判定「非官方或低版本」。
+          codesign -d --entitlements :- "$BIN_PATH" > ent.plist 2>/dev/null || true
+          echo "=== 原始 entitlements ==="
+          cat ent.plist || true
+          if ! grep -q "application-identifier" ent.plist; then
+            echo "ERROR: 原始包没有 entitlements，中止"
+            exit 1
+          fi
+
           mkdir -p "$APP_DIR/Frameworks"
           cp out/Diditok.dylib "$APP_DIR/Frameworks/"
           python3 inject.py "$BIN_PATH"
+
+          # 新加的 dylib 不需要 entitlements
           codesign --force --sign - "$APP_DIR/Frameworks/Diditok.dylib"
-          codesign --force --deep --sign - "$BIN_PATH"
-          codesign --force --deep --sign - "$APP_DIR"
+          # 主二进制带着原始 entitlements 重签；不要用 --deep（会递归重签并清空嵌套项）
+          codesign --force --sign - --entitlements ent.plist "$BIN_PATH"
+          # 签整个 .app（不加 --deep，嵌套的框架保持它们原来的签名不动）
+          codesign --force --sign - --entitlements ent.plist "$APP_DIR"
+
+          echo "=== 重签后 entitlements 校验 ==="
+          codesign -d --entitlements :- "$BIN_PATH" > after.plist 2>/dev/null || true
+          if grep -q "keychain-access-groups" after.plist && grep -q "application-identifier" after.plist; then
+            echo "OK: entitlements 完整保留"
+          else
+            echo "ERROR: entitlements 丢失"; cat after.plist; exit 1
+          fi
+
           cd ipa_extracted && zip -qr ../diditok-injected.ipa Payload && cd ..
           ls -lh diditok-injected.ipa
 

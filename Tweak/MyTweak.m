@@ -1041,29 +1041,42 @@ static void DidiHideSelf(void) {
 //   · 提示文案不在包内（服务端下发）→ 只能削弱客户端上报的完整性信号
 // ═══════════════════════════════════════════════════════════════════════
 static BOOL DidiReturnNO(id self, SEL _cmd) { return NO; }
+// setter 一律 no-op（注意不调用原实现）：检测方把 YES 写进 cracked/jb 数据模型的
+// 路径整体掐断，数据快照无论什么时候缓存读到的都是“干净”状态。
+// 不做包装转发 → 不需要 per-class 槽位，幂等安全。
+static void DidiSetterNoop(id self, SEL _cmd) { }
 
 // 把「是否破解/越狱/可证明」这类布尔方法统一改成 NO（只认 BOOL 返回，避免误伤）
+// ⚠️ iOS 12+ clang 对 BOOL 的类型编码是 'B'（老 ABI 是 'c'），必须两者都接——
+//    只认 'c' 的话 isCracked(TB,...) 这组整个空转，上一版就是这么失误的。
 static void DidiSuppressIntegrityFlags(void) {
-    static const char *names[] = {
+    static const char *getters[] = {
         "isAppAttestEnabled", "isAppAttestEntitlementPresent",
         "isAppCracked", "isCracked", "isJailbroken", "isJailBreak", "isJailBroken",
-        "isDeviceJailbroken", "isDeviceCracked", "hasCydia", "isPiracy"
+        "isDeviceJailbroken", "isDeviceCracked", "hasCydia", "isPiracy",
+        "isDeviceCheckEnabled"
     };
-    int n = (int)(sizeof(names) / sizeof(names[0]));
+    static const char *setters[] = {
+        "setIsCracked:", "setIsAppCracked:", "setIsJailBreak:", "setIsJailBroken:",
+        "setIsJailbroken:", "setIsDeviceJailbroken:", "setIsDeviceCracked:",
+        "setHasCydia:", "setIsPiracy:"
+    };
+    int ng = (int)(sizeof(getters) / sizeof(getters[0]));
+    int ns = (int)(sizeof(setters) / sizeof(setters[0]));
     int total = objc_getClassList(NULL, 0);
     if (total <= 0) return;
     Class *classes = (Class *)malloc(sizeof(Class) * (size_t)total);
     if (!classes) return;
     total = objc_getClassList(classes, total);
-    int hooked = 0;
+    int hooked = 0, hookedSet = 0;
     for (int i = 0; i < total; i++) {
         Class c = classes[i];
-        for (int j = 0; j < n; j++) {
-            SEL s = sel_registerName(names[j]);
+        for (int j = 0; j < ng; j++) {
+            SEL s = sel_registerName(getters[j]);
             Method m = class_getInstanceMethod(c, s);
             if (m) {
                 const char *t = method_getTypeEncoding(m);
-                if (t && t[0] == 'c') {                 // 'c' = BOOL / char
+                if (t && (t[0] == 'B' || t[0] == 'c')) {  // 'B'/'c' = BOOL 双 ABI 都接
                     method_setImplementation(m, (IMP)DidiReturnNO);
                     hooked++;
                 }
@@ -1071,15 +1084,28 @@ static void DidiSuppressIntegrityFlags(void) {
             Method cm = class_getClassMethod(c, s);
             if (cm) {
                 const char *t = method_getTypeEncoding(cm);
-                if (t && t[0] == 'c') {
+                if (t && (t[0] == 'B' || t[0] == 'c')) {
                     method_setImplementation(cm, (IMP)DidiReturnNO);
                     hooked++;
                 }
             }
         }
+        for (int j = 0; j < ns; j++) {
+            SEL s = sel_registerName(setters[j]);
+            Method m = class_getInstanceMethod(c, s);
+            if (m) {
+                const char *t = method_getTypeEncoding(m);
+                if (t && t[0] == 'v') {                    // void 返回 setter
+                    method_setImplementation(m, (IMP)DidiSetterNoop);
+                    hookedSet++;
+                }
+            }
+        }
     }
     free(classes);
-    NSLog(@"[Diditok] ✓ 完整性开关已压平 %d 处", hooked);
+    NSLog(@"[Diditok] ✓ 完整性开关已压平 getter=%d setter=%d", hooked, hookedSet);
+    DidiDiagAppend([NSString stringWithFormat:
+        @"\n===== [diag] 完整性开关压平 getter=%d setter=%d =====\n", hooked, hookedSet]);
 }
 
 // DCAppAttestService 在重签包里一定不可用，直接让它自报不支持（SDK 会走降级路径）
@@ -1090,6 +1116,7 @@ static void DidiDisableAppAttest(void) {
     if (m) {
         method_setImplementation(m, (IMP)DidiReturnNO);
         NSLog(@"[Diditok] ✓ DCAppAttestService.isSupported → NO");
+        DidiDiagAppend(@"\n===== [diag] DCAppAttestService.isSupported → NO 已安装 =====\n");
     }
 }
 
@@ -1233,6 +1260,7 @@ static void DidiHideDylibFromFS(void) {
                  (IMP)hookedDataOfFile2, &g_origDataOfFile2);
     }
     NSLog(@"[Diditok] ✓ 文件系统枚举已过滤 Diditok / mobileprovision");
+    DidiDiagAppend(@"\n===== [diag] 文件系统枚举过滤 (Diditok/mobileprovision/收据放行) 已安装 =====\n");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1275,6 +1303,8 @@ static void DidiHideProvisionReader(void) {
     }
     free(classes);
     NSLog(@"[Diditok] ✓ getMobileProvision 已归零 %d 处", hooked);
+    DidiDiagAppend([NSString stringWithFormat:
+        @"\n===== [diag] getMobileProvision 已归零 %d 处 =====\n", hooked]);
 }
 
 static NSURL *(*g_origReceiptURL)(id, SEL) = NULL;
@@ -1301,6 +1331,9 @@ static void DidiFakeReceipt(void) {
             g_origReceiptURL = (NSURL *(*)(id, SEL))method_getImplementation(m);
             method_setImplementation(m, (IMP)hookedReceiptURL);
             NSLog(@"[Diditok] ✓ appStoreReceiptURL → 伪装收据  real=%@", g_realReceiptPath ?: @"(无)");
+            DidiDiagAppend([NSString stringWithFormat:
+                @"\n===== [diag] 收据伪装已安装 realReceipt=%@ fakeLen=%lu =====\n",
+                g_realReceiptPath ?: @"(无)", (unsigned long)DidiFakeReceiptData().length]);
         }
     } @catch (NSException *e) {
         NSLog(@"[Diditok] ✗ fake receipt: %@", e);
@@ -1344,6 +1377,8 @@ static void DidiSpoofVersionStrings(void) {
         method_setImplementation(m2, (IMP)hookedInfoDict);
     }
     NSLog(@"[Diditok] ✓ 版本伪装 CFBundleShortVersionString → %@", DIDITOK_SPOOF_VERSION);
+    DidiDiagAppend([NSString stringWithFormat:
+        @"\n===== [diag] 版本伪装(NSBundle 层)→%@ 已安装 =====\n", DIDITOK_SPOOF_VERSION]);
 }
 
 // ⚠️ 这三层必须等 App 启动完再装。

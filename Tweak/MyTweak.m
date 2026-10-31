@@ -49,6 +49,10 @@ static const int   kAesKeyLen = 16;
 static const int   kAesIvLen  = 16;
 #define DIDITOK_PASSWORD   @"18075893937"
 
+// ⚠️ 临时开关：1 = 零 hook / 零反检测测试包（只保留悬浮球），用于定位「非官方或低版本」
+//    测完把它改回 0 即可恢复全部功能
+#define DIDITOK_TEST_MODE  1
+
 // ═══════════════════════════════════════════════════════════════════════
 // 状态
 // ═══════════════════════════════════════════════════════════════════════
@@ -1018,6 +1022,7 @@ static void diditok_init(void) {
     @autoreleasepool {
       @try {
         NSLog(@"[Diditok] ▶ constructor fired");
+#if !DIDITOK_TEST_MODE
         DidiHideSelf();
 
         g_harLock    = [NSLock new];
@@ -1077,6 +1082,7 @@ static void diditok_init(void) {
         } @catch (NSException *e) {
             NSLog(@"[Diditok] ✗ AES self-test FAILED: %@", e);
         }
+#endif  // !DIDITOK_TEST_MODE
 
         // 等 App 完全启动后再建 UIWindow
         g_launchObserver = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
@@ -1084,14 +1090,14 @@ static void diditok_init(void) {
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification *note) {
             NSLog(@"[Diditok] ▶ UIApplicationDidFinishLaunching → setupFloatUI");
-            DidiInstallGuards();
+            if (!DIDITOK_TEST_MODE) DidiInstallGuards();
             setupFloatUI();
         }];
 
         // 兜底：如果通知没触发（罕见），3 秒后强制
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3000000000)),
                        dispatch_get_main_queue(), ^{
-            DidiInstallGuards();
+            if (!DIDITOK_TEST_MODE) DidiInstallGuards();
             setupFloatUI();
         });
 

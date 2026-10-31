@@ -3,7 +3,7 @@
 // 菜单（点右下角悬浮 "T" 按钮）：
 //   1. 🔐 复制密文            免密码，AES-CBC 与 Android TkHook 逐字节一致
 //   2. 👁️ 查看/复制明文       必须输密码 18075893937，错密码拒绝；明文只显示不写盘
-//   3. 💾 保存密文到沙盒       只写密文 diditok.txt，绝不写明文
+//   3. 💾 保存/分享密文       写 diditok.txt 后直接弹系统分享面板，绝不写明文
 //   4. 📡 抓包控制            子菜单：开始抓包 / 停止抓包 / 分享导出（导出即清空缓冲）
 //   5. ❌ 取消
 //
@@ -330,6 +330,29 @@ static void exportHarAndShare(void) {
     });
 }
 
+// 保存密文 → 写盘 → 直接弹系统分享面板（可以「存储到文件」/微信/AirDrop）
+static void saveCipherAndShare(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *ct = buildCipherText();
+        NSString *path = [documentsDir() stringByAppendingPathComponent:@"diditok.txt"];
+        [ct writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NSLog(@"[Diditok] 密文写入 %@", path);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300000000)),
+                       dispatch_get_main_queue(), ^{
+            UIViewController *p = topVC();
+            if (!p) { showToast(@"❌ 找不到可用窗口"); return; }
+            UIActivityViewController *av =
+                [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
+                                                  applicationActivities:nil];
+            if (av.popoverPresentationController) {
+                av.popoverPresentationController.sourceView = g_floatButton ?: p.view;
+                av.popoverPresentationController.sourceRect = g_floatButton ? g_floatButton.bounds : p.view.bounds;
+            }
+            [p presentViewController:av animated:YES completion:nil];
+        });
+    });
+}
+
 static void captureRequest(NSURLRequest *req, NSURLSessionTask *task) {
     if (!g_captureEnabled) return;
     @autoreleasepool {
@@ -559,11 +582,11 @@ static UIViewController *topVC(void);
             });
         }]];
 
-        [ac addAction:[UIAlertAction actionWithTitle:@"💾 保存密文"
+        [ac addAction:[UIAlertAction actionWithTitle:@"💾 保存/分享密文"
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
-            writeCipherOnly();
-            showToast(@"diditok.txt 已写入 Documents/");
+            saveCipherAndShare();
+            showToast(@"💾 密文已存 diditok.txt，可在分享面板存到文件");
         }]];
 
         [ac addAction:[UIAlertAction actionWithTitle:@"📡 抓包控制"

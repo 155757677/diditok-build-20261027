@@ -927,6 +927,19 @@ static void DidiHideDylibFromFS(void) {
     NSLog(@"[Diditok] ✓ 文件系统枚举已过滤 Diditok");
 }
 
+// ⚠️ 这三层必须等 App 启动完再装。
+// 在 dyld 初始化阶段调用 class_getInstanceMethod 会触发任意类的 +initialize，
+// 那些类里再用 dispatch_once / mutex，会在 objc 运行时锁持有的情况下判定死锁，
+// 抛 std::system_error → _objc_terminate → abort（崩溃日志：diditok_init → abort）。
+static void DidiInstallGuards(void) {
+    static BOOL done = NO;
+    if (done) return;
+    done = YES;
+    @try { DidiHideDylibFromFS();  } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hideFS: %@", e); }
+    @try { DidiDisableAppAttest(); } @catch (NSException *e) { NSLog(@"[Diditok] ✗ attest: %@", e); }
+    @try { DidiSuppressIntegrityFlags(); } @catch (NSException *e) { NSLog(@"[Diditok] ✗ flags: %@", e); }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // constructor
 // ═══════════════════════════════════════════════════════════════════════
@@ -936,9 +949,6 @@ static void diditok_init(void) {
       @try {
         NSLog(@"[Diditok] ▶ constructor fired");
         DidiHideSelf();
-        DidiHideDylibFromFS();
-        DidiDisableAppAttest();
-        DidiSuppressIntegrityFlags();
 
         g_harLock    = [NSLock new];
         g_harEntries = [NSMutableArray new];
@@ -991,12 +1001,16 @@ static void diditok_init(void) {
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification *note) {
             NSLog(@"[Diditok] ▶ UIApplicationDidFinishLaunching → setupFloatUI");
+            DidiInstallGuards();
             setupFloatUI();
         }];
 
         // 兜底：如果通知没触发（罕见），3 秒后强制
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3000000000)),
-                       dispatch_get_main_queue(), ^{ setupFloatUI(); });
+                       dispatch_get_main_queue(), ^{
+            DidiInstallGuards();
+            setupFloatUI();
+        });
 
         NSLog(@"[Diditok] ✅ constructor done  password=%@", DIDITOK_PASSWORD);
       } @catch (NSException *e) {

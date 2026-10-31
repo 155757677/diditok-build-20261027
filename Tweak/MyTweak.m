@@ -21,6 +21,10 @@
 #import <UIKit/UIKit.h>
 #import <CommonCrypto/CommonCryptor.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <string.h>
+#import <dlfcn.h>
 
 // ═══════════════════════════════════════════════════════════════════════
 // 自研 hook（不依赖 Cydia Substrate / MobileSubstrate）
@@ -602,6 +606,101 @@ static void setupFloatUI(void) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// 反检测：把自己从 dyld 的镜像表里抹掉
+//
+// 滴滴安全组件通过公开 API 枚举已加载镜像：
+//   _dyld_image_count / _dyld_get_image_name / _dyld_get_image_header
+//   _dyld_get_image_vmaddr_slide / _dyld_register_func_for_add_image
+// 它们全部读同一份全局表 _dyld_all_image_infos.infoArray。
+// 所以不用 fishhook、不用改任何函数，直接改表里"我们这一条"的路径和 header，
+// 让所有枚举者看到的都是一个系统库，看不到 Diditok.dylib。
+// dyld 之后 dlopen 新镜像可能重建这张表，所以在新增镜像回调里再刷一次。
+//
+// 表结构（64 位）：
+//   +0  uint32 version
+//   +4  uint32 infoArrayCount
+//   +8  const dyld_image_info *infoArray   // 每项：loadAddr / path / modDate
+// ═══════════════════════════════════════════════════════════════════════
+
+typedef struct {
+    const void *imageLoadAddress;
+    const char *imageFilePath;
+    uintptr_t   imageFileModDate;
+} DidiImageInfo;
+
+static uint32_t    g_hideIndex = UINT32_MAX;
+static const void *g_spoofAddr = NULL;
+static const char *g_spoofPath = NULL;
+static BOOL        g_hiding    = NO;
+static void       *g_ai        = NULL;   // _dyld_all_image_infos 地址（固定不变，只解析一次）
+
+static void DidiApplyHide(void) {
+    if (!g_hiding || !g_spoofPath || !g_ai) return;
+    void *ai = g_ai;
+    uint32_t count = *(uint32_t *)((char *)ai + 4);
+    DidiImageInfo *arr = *(DidiImageInfo **)((char *)ai + 8);
+    if (!arr || count == 0) return;
+
+    // 表可能被 dyld 重建，先按真实路径重新定位自己
+    int idx = -1;
+    for (uint32_t i = 0; i < count; i++) {
+        const char *p = arr[i].imageFilePath;
+        if (p && (strstr(p, "Diditok") || strstr(p, "diditok"))) { idx = (int)i; break; }
+    }
+    if (idx < 0) idx = (int)g_hideIndex;
+    if ((uint32_t)idx >= count) return;
+
+    arr[idx].imageFilePath    = g_spoofPath;
+    arr[idx].imageLoadAddress = g_spoofAddr;
+}
+
+static void DidiOnImageAdded(const struct mach_header *mh, intptr_t slide) {
+    DidiApplyHide();
+}
+
+static void DidiHideSelf(void) {
+    int n = _dyld_image_count();
+    for (int i = n - 1; i >= 0; i--) {
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && (strstr(nm, "Diditok") || strstr(nm, "diditok"))) {
+            g_hideIndex = (uint32_t)i;
+            break;
+        }
+    }
+    if (g_hideIndex == UINT32_MAX) {
+        NSLog(@"[Diditok] ⚠️ 镜像表里没找到自己，跳过隐藏");
+        return;
+    }
+
+    // 替身：优先挑 /usr/lib 下的系统库
+    for (int i = 0; i < n; i++) {
+        if ((uint32_t)i == g_hideIndex) continue;
+        const char *nm = _dyld_get_image_name(i);
+        if (!nm) continue;
+        if (strncmp(nm, "/usr/lib/", 9) == 0) {
+            g_spoofPath = nm;
+            g_spoofAddr = _dyld_get_image_header((uint32_t)i);
+            break;
+        }
+    }
+    if (!g_spoofPath) {
+        g_spoofPath = _dyld_get_image_name(0);
+        g_spoofAddr = _dyld_get_image_header(0);
+    }
+    if (!g_spoofPath) return;
+
+    g_ai = dlsym(RTLD_DEFAULT, "_dyld_all_image_infos");
+    if (!g_ai) {
+        NSLog(@"[Diditok] ⚠️ _dyld_all_image_infos 不可用，跳过隐藏");
+        return;
+    }
+    g_hiding = YES;
+    DidiApplyHide();
+    _dyld_register_func_for_add_image(DidiOnImageAdded);
+    NSLog(@"[Diditok] ✓ 已隐藏自身镜像 idx=%u → %s", g_hideIndex, g_spoofPath);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // constructor
 // ═══════════════════════════════════════════════════════════════════════
 __attribute__((constructor))
@@ -609,6 +708,7 @@ static void diditok_init(void) {
     @autoreleasepool {
       @try {
         NSLog(@"[Diditok] ▶ constructor fired");
+        DidiHideSelf();
 
         g_harLock    = [NSLock new];
         g_harEntries = [NSMutableArray new];

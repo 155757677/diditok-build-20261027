@@ -17,11 +17,26 @@
 //   diditok.txt       — 密文一行
 //   diditok_full.har  — Proxyman HAR 1.2 抓包
 
-#import <substrate.h>
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <CommonCrypto/CommonCryptor.h>
 #import <objc/runtime.h>
+
+// ═══════════════════════════════════════════════════════════════════════
+// 自研 hook（不依赖 Cydia Substrate / MobileSubstrate）
+// 非越狱（TrollStore）设备上没有 libsubstrate，调用 MSHookMessageEx
+// 会在 dyld 加载阶段符号解析失败 → App 启动即闪退。
+// 这里改用 Objective-C runtime 的 method_setImplementation。
+// ═══════════════════════════════════════════════════════════════════════
+static BOOL DidiHook(Class cls, SEL sel, IMP newImp, IMP *outOld) {
+    if (!cls || !sel || !newImp) return NO;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NO;
+    if (outOld) *outOld = method_getImplementation(m);
+    method_setImplementation(m, newImp);
+    return YES;
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════
 // 常量
@@ -58,7 +73,9 @@ static IMP g_origUserPhone = NULL;
 
 static NSMutableDictionary *g_pendingHarMap;
 
-static id g_launchObserver = nil;// ═══════════════════════════════════════════════════════════════════════
+static id g_launchObserver = nil;
+
+// ═══════════════════════════════════════════════════════════════════════
 // HAR response forward declaration
 // ═══════════════════════════════════════════════════════════════════════
 static NSDictionary *harResponseFrom(NSURLResponse *resp, NSData *body, NSTimeInterval timingMs);
@@ -557,6 +574,7 @@ static void setupFloatUI(void) {
 __attribute__((constructor))
 static void diditok_init(void) {
     @autoreleasepool {
+      @try {
         NSLog(@"[Diditok] ▶ constructor fired");
 
         g_harLock    = [NSLock new];
@@ -565,17 +583,17 @@ static void diditok_init(void) {
         g_reSs       = [NSRegularExpression regularExpressionWithPattern:@"didi-header-ssuuid:\\s*(\\S+)" options:0 error:nil];
         g_reDev      = [NSRegularExpression regularExpressionWithPattern:@"didi-header-deviceid:\\s*(\\S+)" options:0 error:nil];
 
-        // ✅ 修 1: MSHookMessageEx(Class, SEL, IMP, &oldIMP) — 不要传 Method！
+                // hook NSURLSession（ObjC runtime 交换，无需 Substrate）
         Class sessCls = NSClassFromString(@"NSURLSession");
         if (sessCls) {
             SEL s1 = NSSelectorFromString(@"dataTaskWithRequest:completionHandler:");
             SEL s2 = NSSelectorFromString(@"dataTaskWithRequest:");
             @try {
-                MSHookMessageEx(sessCls, s1, (IMP)hookedDataTask1, &g_origDataTask1);
+                DidiHook(sessCls, s1, (IMP)hookedDataTask1, &g_origDataTask1);
                 NSLog(@"[Diditok] ✓ hooked NSURLSession.dataTaskWithRequest:completionHandler:");
             } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook s1 failed: %@", e); }
             @try {
-                MSHookMessageEx(sessCls, s2, (IMP)hookedDataTask2, &g_origDataTask2);
+                DidiHook(sessCls, s2, (IMP)hookedDataTask2, &g_origDataTask2);
                 NSLog(@"[Diditok] ✓ hooked NSURLSession.dataTaskWithRequest:");
             } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook s2 failed: %@", e); }
         } else {
@@ -589,10 +607,10 @@ static void diditok_init(void) {
             if (!c) continue;
             NSLog(@"[Diditok] ✓ UserInfoCallback class = %@", name);
             @try {
-                MSHookMessageEx(c, @selector(getToken), (IMP)hookedUserToken, &g_origUserToken);
+                DidiHook(c, @selector(getToken), (IMP)hookedUserToken, &g_origUserToken);
             } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook getToken: %@", e); }
             @try {
-                MSHookMessageEx(c, @selector(getPhoneNumber), (IMP)hookedUserPhone, &g_origUserPhone);
+                DidiHook(c, @selector(getPhoneNumber), (IMP)hookedUserPhone, &g_origUserPhone);
             } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook getPhoneNumber: %@", e); }
             break;
         }
@@ -606,8 +624,8 @@ static void diditok_init(void) {
             NSLog(@"[Diditok] ✗ AES self-test FAILED: %@", e);
         }
 
-        // ✅ 修 4: UI 延迟 setup — 等 App 完全启动后再建 UIWindowg_launchObserver = 
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
+        // 等 App 完全启动后再建 UIWindow
+        g_launchObserver = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification *note) {
@@ -620,5 +638,8 @@ static void diditok_init(void) {
                        dispatch_get_main_queue(), ^{ setupFloatUI(); });
 
         NSLog(@"[Diditok] ✅ constructor done  password=%@", DIDITOK_PASSWORD);
+      } @catch (NSException *e) {
+        NSLog(@"[Diditok] ✗ constructor exception: %@", e);
+      }
     }
 }

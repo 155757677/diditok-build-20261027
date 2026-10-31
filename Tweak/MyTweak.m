@@ -4,9 +4,8 @@
 //   1. 🔐 复制密文            免密码，AES-CBC 与 Android TkHook 逐字节一致
 //   2. 👁️ 查看/复制明文       必须输密码 18075893937，错密码拒绝；明文只显示不写盘
 //   3. 💾 保存密文到沙盒       只写密文 diditok.txt，绝不写明文
-//   4. 📡 抓包控制            子菜单：开始 / 停止 / 导出 HAR / 清空缓冲
-//   5. 📖 当前状态
-//   6. ❌ 取消
+//   4. 📡 抓包控制            子菜单：开始抓包 / 停止抓包 / 分享导出（导出即清空缓冲）
+//   5. ❌ 取消
 //
 // 加密格式（与 Android TkHook 完全一致）：
 //   JSON {Phone, token, auToken, ddfp}
@@ -288,9 +287,13 @@ static NSDictionary *buildHarEntry(NSURLRequest *req, NSURLResponse *resp,
     return entry;
 }
 
-static void exportHarToFile(void) {
+// 导出 HAR → 写盘 → 弹系统分享面板 → 清空缓冲（避免误触重复导出）
+static UIViewController *topVC(void);   // 定义在后面，这里先声明
+static void exportHarAndShare(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [g_harLock lock]; NSArray *snap = [g_harEntries copy]; [g_harLock unlock];
+        if (snap.count == 0) { showToast(@"⚠️ 还没有抓到请求"); return; }
+
         NSDictionary *har = @{@"log": @{
             @"version": @"1.2",
             @"creator": @{@"name": @"Diditok", @"version": @"0.4"},
@@ -299,10 +302,30 @@ static void exportHarToFile(void) {
         NSError *err;
         NSData *data = [NSJSONSerialization dataWithJSONObject:har options:NSJSONWritingPrettyPrinted error:&err];
         if (!data) { showToast([NSString stringWithFormat:@"❌ HAR 失败: %@", err]); return; }
+
         NSString *path = [documentsDir() stringByAppendingPathComponent:@"diditok_full.har"];
         [data writeToFile:path atomically:YES];
-        showToast([NSString stringWithFormat:@"📤 HAR 已导出 %d 条", (int)snap.count]);
         NSLog(@"[Diditok] HAR %d → %@", (int)snap.count, path);
+
+        // 导出即清空缓冲
+        [g_harLock lock]; g_harEntries = [NSMutableArray new]; g_harSeq = 0; [g_harLock unlock];
+
+        showToast([NSString stringWithFormat:@"📤 已导出 %d 条，选「存储到文件」可存到 iCloud/本地", (int)snap.count]);
+
+        // 等子菜单收起后再弹分享面板
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300000000)),
+                       dispatch_get_main_queue(), ^{
+            UIViewController *p = topVC();
+            if (!p) { showToast(@"❌ 找不到可用窗口"); return; }
+            UIActivityViewController *av =
+                [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
+                                                  applicationActivities:nil];
+            if (av.popoverPresentationController) {
+                av.popoverPresentationController.sourceView = g_floatButton ?: p.view;
+                av.popoverPresentationController.sourceRect = g_floatButton ? g_floatButton.bounds : p.view.bounds;
+            }
+            [p presentViewController:av animated:YES completion:nil];
+        });
     });
 }
 
@@ -416,47 +439,38 @@ static UIViewController *topVC(void);
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
             UIAlertController *sub = [UIAlertController alertControllerWithTitle:@"📡 抓包控制"
-                                                                         message:g_captureEnabled ? @"🔴 进行中..." : @"⚪ 未开启"
+                                                                         message:g_captureEnabled ? @"🔴 正在抓包…" : @"⚪ 未开启"
                                                                   preferredStyle:UIAlertControllerStyleAlert];
-            if (!g_captureEnabled) {
-                [sub addAction:[UIAlertAction actionWithTitle:@"▶️ 开始抓包" style:UIAlertActionStyleDefault handler:^(UIAlertAction *b) {
-                    [g_harLock lock]; g_harEntries = [NSMutableArray new]; g_harSeq = 0; [g_harLock unlock];
-                    g_captureEnabled = YES;
-                    setButtonColor([UIColor redColor]);
-                    showToast(@"🔴 开始抓包");
-                }]];
-            } else {
-                [sub addAction:[UIAlertAction actionWithTitle:@"⏸️ 停止抓包" style:UIAlertActionStyleDefault handler:^(UIAlertAction *b) {
-                    g_captureEnabled = NO;
-                    setButtonColor([UIColor colorWithRed:0.1 green:0.7 blue:0.2 alpha:0.9]);
-                    showToast(@"⏸ 已停止");
-                }]];
-                [sub addAction:[UIAlertAction actionWithTitle:@"📤 导出 HAR" style:UIAlertActionStyleDefault handler:^(UIAlertAction *b) {
-                    exportHarToFile();
-                }]];
-                [sub addAction:[UIAlertAction actionWithTitle:@"🗑️ 清空缓冲" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *b) {
-                    [g_harLock lock]; g_harEntries = [NSMutableArray new]; g_harSeq = 0; [g_harLock unlock];
-                    showToast(@"缓冲已清空");
-                }]];
-            }
+
+            UIAlertAction *start = [UIAlertAction actionWithTitle:@"▶️ 开始抓包"
+                                                            style:UIAlertActionStyleDefault
+                                                          handler:^(UIAlertAction *b) {
+                [g_harLock lock]; g_harEntries = [NSMutableArray new]; g_harSeq = 0; [g_harLock unlock];
+                g_captureEnabled = YES;
+                setButtonColor([UIColor redColor]);
+                showToast(@"🔴 开始抓包");
+            }];
+            start.enabled = !g_captureEnabled;
+            [sub addAction:start];
+
+            UIAlertAction *stop = [UIAlertAction actionWithTitle:@"⏹ 停止抓包"
+                                                           style:UIAlertActionStyleDefault
+                                                         handler:^(UIAlertAction *b) {
+                g_captureEnabled = NO;
+                setButtonColor([UIColor colorWithRed:0.1 green:0.7 blue:0.2 alpha:0.9]);
+                showToast(@"⏹ 已停止抓包（已抓到的仍在内存，可点分享导出）");
+            }];
+            stop.enabled = g_captureEnabled;
+            [sub addAction:stop];
+
+            [sub addAction:[UIAlertAction actionWithTitle:@"📤 分享导出"
+                                                    style:UIAlertActionStyleDefault
+                                                  handler:^(UIAlertAction *b) {
+                exportHarAndShare();
+            }]];
+
             [sub addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
             [vc presentViewController:sub animated:YES completion:nil];
-        }]];
-
-        [ac addAction:[UIAlertAction actionWithTitle:@"📖 当前状态"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-            [g_harLock lock]; int cnt = (int)g_harEntries.count; [g_harLock unlock];
-            NSString *msg = [NSString stringWithFormat:
-                @"Phone: %@\ntoken: %@\nauToken: %@\nddfp: %@\ndeviceId: %@\n抓包: %@  条目: %d",
-                g_lastPhone ?: @"—", g_lastToken ?: @"—",
-                g_lastAuToken ?: @"—", g_lastDdfp ?: @"—", g_lastDeviceId ?: @"—",
-                g_captureEnabled ? @"🔴" : @"⚪", cnt];
-            UIAlertController *a2 = [UIAlertController alertControllerWithTitle:@"📖 状态"
-                                                                          message:msg
-                                                                   preferredStyle:UIAlertControllerStyleAlert];
-            [a2 addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
-            [vc presentViewController:a2 animated:YES completion:nil];
         }]];
 
         [ac addAction:[UIAlertAction actionWithTitle:@"❌ 取消" style:UIAlertActionStyleCancel handler:nil]];

@@ -61,27 +61,27 @@ jobs:
           #    只有当原始包版本 < APP_VERSION 时才替换，避免以后打 9.x 包时被降级。
           NEW_VER=8.0.18
           python3 - "$APP_DIR/Info.plist" "$NEW_VER" <<'PY'
-import sys, os, plistlib, time
-p, new = sys.argv[1], sys.argv[2]
-with open(p, 'rb') as f:
-    d = plistlib.load(f)
-def k(v):
-    out = []
-    for x in (v or '').split('.'):
-        out.append(int(x) if x.isdigit() else 0)
-    return tuple(out)
-old = d.get('CFBundleShortVersionString') or ''
-if k(new) > k(old):
-    b = d.get('CFBundleVersion') or ''
-    tail = b.split('.')[-1] if '.' in b else str(int(time.time()))
-    d['CFBundleShortVersionString'] = new
-    d['CFBundleVersion'] = f'{new}.{tail}'
-    with open(p, 'wb') as f:
-        plistlib.dump(d, f)
-    print(f'[version] {old} / {b} -> {new} / {d["CFBundleVersion"]}')
-else:
-    print(f'[version] keep {old} (>= {new})')
-PY
+          import sys, os, plistlib, time
+          p, new = sys.argv[1], sys.argv[2]
+          with open(p, 'rb') as f:
+              d = plistlib.load(f)
+          def k(v):
+              out = []
+              for x in (v or '').split('.'):
+                  out.append(int(x) if x.isdigit() else 0)
+              return tuple(out)
+          old = d.get('CFBundleShortVersionString') or ''
+          if k(new) > k(old):
+              b = d.get('CFBundleVersion') or ''
+              tail = b.split('.')[-1] if '.' in b else str(int(time.time()))
+              d['CFBundleShortVersionString'] = new
+              d['CFBundleVersion'] = f'{new}.{tail}'
+              with open(p, 'wb') as f:
+                  plistlib.dump(d, f)
+              print(f'[version] {old} / {b} -> {new} / {d["CFBundleVersion"]}')
+          else:
+              print(f'[version] keep {old} (>= {new})')
+          PY
 
           # ⚠️ 关键：必须在 LIEF 改动前，把主二进制的原始 entitlements 备份出来。
           # 之前用 codesign --force --deep --sign - 重签把 entitlements 全部抹掉了

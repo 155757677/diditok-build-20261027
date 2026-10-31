@@ -240,6 +240,69 @@ static BOOL DidiDiagInterestingText(NSString *s) {
     return NO;
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// 请求环缓冲：记录最近 12 个 URLSession 请求的 URL + 安全头（wsgsig/wsgenv）
+// 命中 58103/非官方 时把快照丢进诊断日志 → 直接判定「签名缺失」还是「签名在场仍被拒」
+// ═══════════════════════════════════════════════════════════════════════
+#define DIDI_RING_N 12
+static NSString *g_ringURL[DIDI_RING_N];
+static NSString *g_ringSig[DIDI_RING_N];
+static NSString *g_ringEnv[DIDI_RING_N];
+static int  g_ringIdx   = 0;
+static int  g_ringCount = 0;
+static NSLock *g_ringLock = nil;
+
+static void DidiRingPush(NSURLRequest *req) {
+    if (!req) return;
+    if (!g_ringLock) g_ringLock = [NSLock new];
+    NSString *url = req.URL.absoluteString ?: @"";
+    if (!url.length) return;
+    NSDictionary *h = req.allHTTPHeaderFields;
+    NSString *sig = [h objectForKey:@"wsgsig"] ?: @"";
+    NSString *env = [h objectForKey:@"wsgenv"] ?: @"";
+    [g_ringLock lock];
+    @try {
+        g_ringURL[g_ringIdx] = url;
+        g_ringSig[g_ringIdx] = sig;
+        g_ringEnv[g_ringIdx] = env;
+        g_ringIdx = (g_ringIdx + 1) % DIDI_RING_N;
+        if (g_ringCount < DIDI_RING_N) g_ringCount++;
+    } @finally { [g_ringLock unlock]; }
+}
+
+static NSString *DidiRingDump(void) {
+    if (!g_ringLock) return @"<ring empty>";
+    [g_ringLock lock];
+    @try {
+        int n = g_ringCount;
+        if (!n) { return @"<ring empty>"; }
+        NSMutableString *s = [NSMutableString string];
+        for (int k = n; k >= 1; k--) {
+            int i = ((g_ringIdx - k) % DIDI_RING_N + DIDI_RING_N) % DIDI_RING_N;
+            NSString *sig = g_ringSig[i] ?: @"";
+            NSString *env = g_ringEnv[i] ?: @"";
+            [s appendFormat:@"  req[-%d] %@\n", k - 1, g_ringURL[i] ?: @""];
+            if (sig.length) [s appendFormat:@"      wsgsig(%lu)=%@\n",
+                              (unsigned long)sig.length, [sig substringToIndex:MIN((NSUInteger)90, sig.length)]];
+            else           [s appendFormat:@"      wsgsig=ABSENT!\n"];
+            if (env.length) [s appendFormat:@"      wsgenv(%lu)=%@\n",
+                             (unsigned long)env.length, [env substringToIndex:MIN((NSUInteger)90, env.length)]];
+            else            [s appendFormat:@"      wsgenv=ABSENT!\n"];
+        }
+        return s;
+    } @finally { [g_ringLock unlock]; }
+}
+
+static void DidiDiagRingIfRejected(NSString *body) {
+    @try {
+        if (body.length &&
+            ([body containsString:@"58103"] || [body containsString:@"非官方"])) {
+            DidiDiagAppend([NSString stringWithFormat:
+                @"\n===== [ring] 拒绝时刻最近请求快照 =====\n%@\n", DidiRingDump()]);
+        }
+    } @catch (NSException *e) {}
+}
+
 // 记录「URL 命中关键词 或 响应体含可疑字段」的请求。
 static void DidiDiagNetwork(NSURLRequest *req, NSURLResponse *resp, NSData *body) {
     @autoreleasepool {
@@ -269,6 +332,7 @@ static void DidiDiagNetwork(NSURLRequest *req, NSURLResponse *resp, NSData *body
 }
 
 // NSJSONSerialization 统一拦截点：登录/风控接口响应几乎都会在这里被解析一次
+// （名字保持 DidiDiagJSON，与 hookedJSONObject 里的调用点一致）
 static void DidiDiagJSON(id obj) {
     @autoreleasepool {
         if (!obj || ![NSJSONSerialization isValidJSONObject:obj]) return;
@@ -279,6 +343,8 @@ static void DidiDiagJSON(id obj) {
         if (s.length > 8000) s = [s substringToIndex:8000];
         DidiDiagAppend([NSString stringWithFormat:@"\n===== %@  JSON =====\n%@\n",
                         [NSDate date], s]);
+        // 命中 58103/非官方 → 把最近请求快照一起落盘（判定签名头到底带没带）
+        DidiDiagRingIfRejected(s);
     }
 }
 
@@ -774,6 +840,7 @@ static UIViewController *topVC(void);
 // ═══════════════════════════════════════════════════════════════════════
 static id hookedDataTask1(id self, SEL _cmd, NSURLRequest *req, id handler) {
     typedef id (*o_t)(id, SEL, NSURLRequest *, id);
+    @try { DidiRingPush(req); } @catch (NSException *e) {}
     // 包一层 completionHandler，顺手拿到响应体（只有这样才能补手机号）
     id wrapped = handler;
     if (handler) {
@@ -796,6 +863,7 @@ static id hookedDataTask1(id self, SEL _cmd, NSURLRequest *req, id handler) {
 }
 static id hookedDataTask2(id self, SEL _cmd, NSURLRequest *req) {
     typedef id (*o_t)(id, SEL, NSURLRequest *);
+    @try { DidiRingPush(req); } @catch (NSException *e) {}
     id task = nil;
     if (g_origDataTask2) {
         task = ((o_t)g_origDataTask2)(self, _cmd, req);
@@ -803,6 +871,23 @@ static id hookedDataTask2(id self, SEL _cmd, NSURLRequest *req) {
         task = ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, req);
     }
     scanHeaders(req, @"NSURLSession#dataTaskWithRequest:", task);
+    return task;
+}
+// 第三形态：dataTaskWithURL:（滴滴部分敏感请求可能走这条路）
+static IMP g_origDataTaskURL = NULL;
+static id hookedDataTaskURL(id self, SEL _cmd, NSURL *u) {
+    typedef id (*o_t)(id, SEL, NSURL *);
+    id task = nil;
+    if (g_origDataTaskURL) {
+        task = ((o_t)g_origDataTaskURL)(self, _cmd, u);
+    } else {
+        task = ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, u);
+    }
+    @try {
+        NSURLRequest *r = [NSURLRequest requestWithURL:u];
+        DidiRingPush(r);
+        scanHeaders(r, @"NSURLSession#dataTaskWithURL:", task);
+    } @catch (NSException *e) {}
     return task;
 }
 
@@ -1424,6 +1509,13 @@ static void diditok_init(void) {
                 DidiHook(sessCls, s2, (IMP)hookedDataTask2, &g_origDataTask2);
                 NSLog(@"[Diditok] ✓ hooked NSURLSession.dataTaskWithRequest:");
             } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook s2 failed: %@", e); }
+            // 第三形态 dataTaskWithURL: —— 用于补捕获不走 request 变体的请求（迭代 3）
+            @try {
+                SEL s3 = NSSelectorFromString(@"dataTaskWithURL:");
+                DidiHook(sessCls, s3, (IMP)hookedDataTaskURL, &g_origDataTaskURL);
+                NSLog(@"[Diditok] ✓ hooked NSURLSession.dataTaskWithURL:");
+                DidiDiagAppend(@"\n===== [diag] NSURLSession.dataTaskWithURL: 已安装 =====\n");
+            } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook s3 failed: %@", e); }
         } else {
             NSLog(@"[Diditok] ⚠️ NSURLSession not found (shouldn't happen)");
         }

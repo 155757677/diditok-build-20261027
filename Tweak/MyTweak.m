@@ -48,10 +48,9 @@ static const char *kAesKey   = "MFY-TK-ENC-2026!";
 static const int   kAesKeyLen = 16;
 static const int   kAesIvLen  = 16;
 #define DIDITOK_PASSWORD   @"18075893937"
-
-// ⚠️ 临时开关：1 = 零 hook / 零反检测测试包（只保留悬浮球），用于定位「非官方或低版本」
-//    测完把它改回 0 即可恢复全部功能
-#define DIDITOK_TEST_MODE  1
+// 版本伪装：App Store 上最新是 8.0.18（2026-10-29 上架），登录侧「非官方或低版本」
+// 有版本门控分支 —— 上报时按新版报，Original 包再新一键构建时若版本数字更大则自动跳过伪装。
+#define DIDITOK_SPOOF_VERSION @"8.0.18"
 
 // ═══════════════════════════════════════════════════════════════════════
 // 状态
@@ -84,9 +83,12 @@ static NSMutableDictionary *g_pendingHarMap;
 static id g_launchObserver = nil;
 
 // ═══════════════════════════════════════════════════════════════════════
-// HAR response forward declaration
+// 前向声明（定义在后面）
 // ═══════════════════════════════════════════════════════════════════════
 static NSDictionary *harResponseFrom(NSURLResponse *resp, NSData *body, NSTimeInterval timingMs);
+static void DidiDiagAppend(NSString *text);   // 诊断日志（定义在 writeCipherOnly 之后）
+static NSString *diagLogPath(void);
+static void shareFileNow(NSString *path);     // 定义在 topVC() 之后
 
 // ═══════════════════════════════════════════════════════════════════════
 // KVO 接收
@@ -178,6 +180,105 @@ static void writeCipherOnly(void) {
         [ct writeToFile:[documentsDir() stringByAppendingPathComponent:@"diditok.txt"]
              atomically:YES encoding:NSUTF8StringEncoding error:nil];
         NSLog(@"[Diditok] ✓ 密文写入 Documents/diditok.txt");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 诊断日志：把「版本 / 风控 / 非官方」相关请求与响应原文写进本地
+//   Documents/diditok_risk.log
+// 只用于排查登录时「非官方或低版本」弹窗的来源：不自动上传，
+// 用户在悬浮球菜单里点「导出诊断日志」手动拿到。
+// ═══════════════════════════════════════════════════════════════════════
+static NSLock     *g_diagLock    = nil;
+static NSUInteger  g_diagCount   = 0;
+static const NSUInteger kDiagMaxEntries = 300;
+
+static NSString *diagLogPath(void) {
+    return [documentsDir() stringByAppendingPathComponent:@"diditok_risk.log"];
+}
+
+static void DidiDiagAppend(NSString *text) {
+    if (!text.length) return;
+    if (!g_diagLock) g_diagLock = [NSLock new];
+    [g_diagLock lock];
+    @try {
+        if (g_diagCount < kDiagMaxEntries) {
+            g_diagCount++;
+            NSString *path = diagLogPath();
+            NSFileManager *fm = [NSFileManager defaultManager];
+            if (![fm fileExistsAtPath:path]) {
+                [@"Diditok 诊断日志（只存本机，导出后手动发送）\n"
+                    writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            }
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+            if (fh) {
+                [fh seekToEndOfFile];
+                NSData *d = [text dataUsingEncoding:NSUTF8StringEncoding];
+                if (d) [fh writeData:d];
+                [fh closeFile];
+            }
+        }
+    } @finally {
+        [g_diagLock unlock];
+    }
+}
+
+static BOOL DidiDiagInterestingText(NSString *s) {
+    if (!s.length) return NO;
+    if (s.length > 256 * 1024) return NO;
+    static NSArray *k; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        k = @[@"非官方", @"版本过低", @"官方APP", @"官方APP",
+              @"attest", @"Attest", @"is_cracked", @"isCracked", @"jailbreak",
+              @"version_code", @"app_version", @"appversion", @"min_version",
+              @"minVersion", @"force_update", @"forceUpdate",
+              @"risk_level", @"riskLevel", @"wsgsig", @"wsgenv", @"device_token"];
+    });
+    for (NSString *w in k) {
+        if ([s rangeOfString:w].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+// 记录「URL 命中关键词 或 响应体含可疑字段」的请求。
+static void DidiDiagNetwork(NSURLRequest *req, NSURLResponse *resp, NSData *body) {
+    @autoreleasepool {
+        if (!req) return;
+        NSString *url = req.URL.absoluteString ?: @"";
+        if (!url.length) return;
+        NSString *lu = url.lowercaseString;
+        BOOL urlHit = NO;
+        for (NSString *w in @[@"version", @"risk", @"attest", @"passport", @"login",
+                               @"/conf", @"security."]) {
+            if ([lu containsString:w]) { urlHit = YES; break; }
+        }
+        NSString *text = @"";
+        if (body.length) {
+            NSData *t = body.length > 16384 ? [body subdataWithRange:NSMakeRange(0, 16384)] : body;
+            text = [[NSString alloc] initWithData:t encoding:NSUTF8StringEncoding]
+                   ?: [NSString stringWithFormat:@"<binary %@ bytes>", @(body.length)];
+        }
+        if (!urlHit && !DidiDiagInterestingText(text)) return;
+        NSInteger st = 0;
+        if ([resp isKindOfClass:[NSHTTPURLResponse class]]) st = ((NSHTTPURLResponse *)resp).statusCode;
+        NSString *line = [NSString stringWithFormat:@"\n===== %@  [HTTP:%ld] %@ =====\n%@\n",
+                          [NSDate date], (long)st, url, text.length ? text : @"<无响应体>"];
+        if (line.length > 20000) line = [line substringToIndex:20000];
+        DidiDiagAppend(line);
+    }
+}
+
+// NSJSONSerialization 统一拦截点：登录/风控接口响应几乎都会在这里被解析一次
+static void DidiDiagJSON(id obj) {
+    @autoreleasepool {
+        if (!obj || ![NSJSONSerialization isValidJSONObject:obj]) return;
+        NSData *d = [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil];
+        if (!d || d.length > 65536) return;
+        NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+        if (!DidiDiagInterestingText(s)) return;
+        if (s.length > 8000) s = [s substringToIndex:8000];
+        DidiDiagAppend([NSString stringWithFormat:@"\n===== %@  JSON =====\n%@\n",
+                        [NSDate date], s]);
     }
 }
 
@@ -631,6 +732,18 @@ static UIViewController *topVC(void);
             [vc presentViewController:sub animated:YES completion:nil];
         }]];
 
+        [ac addAction:[UIAlertAction actionWithTitle:@"🧪 导出诊断日志（版本/风控）"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+            NSString *p = diagLogPath();
+            if (![[NSFileManager defaultManager] fileExistsAtPath:p]) {
+                showToast(@"⚠️ 还没有日志，先复现一次「去登录」再回来导出");
+                return;
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400000000)),
+                           dispatch_get_main_queue(), ^{ shareFileNow(p); });
+        }]];
+
         [ac addAction:[UIAlertAction actionWithTitle:@"❌ 取消" style:UIAlertActionStyleCancel handler:nil]];
         if (ac.popoverPresentationController) {
             ac.popoverPresentationController.sourceView = g_floatButton;
@@ -668,6 +781,7 @@ static id hookedDataTask1(id self, SEL _cmd, NSURLRequest *req, id handler) {
             (void (^)(NSData *, NSURLResponse *, NSError *))handler;
         wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
             @try { scanResponseBodyForPhone(data); } @catch (NSException *e) {}
+            @try { DidiDiagNetwork(req, resp, data); } @catch (NSException *e) {}
             orig(data, resp, err);
         };
     }
@@ -716,6 +830,7 @@ static id hookedJSONObject(id self, SEL _cmd, NSData *data, NSJSONReadingOptions
             NSString *p = DidiFindPhoneInJSON(obj, 0, &budget);
             if (p.length) { g_lastPhone = p; onCredsFound(); }
         }
+        DidiDiagJSON(obj);          // 诊断：把「非官方/版本」相关的服务端原文落到日志
     } @catch (NSException *e) {}
     return obj;
 }
@@ -759,6 +874,22 @@ static UIViewController *topVC(void) {
     UIViewController *vc = kw.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
+}
+
+// 通用：弹系统分享面板（分享任意文件）
+static void shareFileNow(NSString *path) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *p = topVC();
+        if (!p) { showToast(@"❌ 找不到可用窗口"); return; }
+        UIActivityViewController *av =
+            [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
+                                              applicationActivities:nil];
+        if (av.popoverPresentationController) {
+            av.popoverPresentationController.sourceView = g_floatButton ?: p.view;
+            av.popoverPresentationController.sourceRect = g_floatButton ? g_floatButton.bounds : p.view.bounds;
+        }
+        [p presentViewController:av animated:YES completion:nil];
+    });
 }
 
 
@@ -963,8 +1094,21 @@ static void DidiDisableAppAttest(void) {
 }
 
 // 让本 dylib 在文件系统枚举里「不存在」（in-memory 隐藏之前做过，对磁盘扫描无效）
+// 宽松签/个人证书侧载的包和 App Store 官方包有两个决定性差异，这里一并抹平：
+//   1) 多出 embedded.mobileprovision（官方包没有）→ 侧载痕迹 → 「非官方」
+//   2) 少了 App Store 收据（官方包装机时系统写入）→ 本地校验会挂
+// 正确方向：profile=不存在、收据=存在，都按官方包的样子来。
 static IMP g_origContentsOfDir = NULL;
+static IMP g_origSubpathsOfDir = NULL;
 static IMP g_origFileExists     = NULL;
+static IMP g_origIsReadable     = NULL;
+static IMP g_origContentsAt     = NULL;
+static IMP g_origAttrOfItem     = NULL;
+static IMP g_origDataOfFile1    = NULL;
+static IMP g_origDataOfFile2    = NULL;
+
+// 官方包应存在而侧载包没有的「App Store 收据」真实路径（装 hook 前抓取的原生值）
+static NSString *g_realReceiptPath = nil;
 
 static BOOL DidiIsOurName(NSString *s) {
     if (!s.length) return NO;
@@ -975,30 +1119,231 @@ static BOOL DidiIsOurName(NSString *s) {
 static BOOL DidiInAppBundle(NSString *path) {
     return path.length && [path.lowercaseString containsString:@".app"];
 }
+// 侧载痕迹：宽松签安装才会出现 embedded.mobileprovision（官方 App Store 包没有）
+static BOOL DidiIsTraceFile(NSString *path) {
+    if (!path.length) return NO;
+    NSString *low = path.lowercaseString;
+    if ([low containsString:@"mobileprovision"]) return YES;
+    return NO;
+}
+// 官方包里应该存在的商店收据路径（fileExists 目录列举 hook 用它放行/提供假内容）
+static BOOL DidiIsReceiptPath(NSString *path) {
+    if (!path || !g_realReceiptPath.length) return NO;
+    return [path isEqualToString:g_realReceiptPath];
+}
+static NSData *DidiFakeReceiptData(void) {
+    static NSData *d; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *s = [NSString stringWithFormat:
+            @"{\"receipt\":{\"bundle_id\":\"com.xiaojukeji.didi\","
+            @"\"application_version\":\"%@\","
+            @"\"creation_date\":\"2026-01-01\",\"opaque\":\"diditok\"},"
+            @"\"signature\":\"diditok\"}", DIDITOK_SPOOF_VERSION];
+        d = [s dataUsingEncoding:NSUTF8StringEncoding];
+    });
+    return d;
+}
 static NSArray *hookedContentsOfDir(id self, SEL _cmd, NSString *path, NSError **err) {
     typedef NSArray *(*o_t)(id, SEL, NSString *, NSError **);
     NSArray *arr = ((o_t)g_origContentsOfDir)(self, _cmd, path, err);
     if (!arr.count || !DidiInAppBundle(path)) return arr;
     NSMutableArray *out = [NSMutableArray arrayWithCapacity:arr.count];
     for (id x in arr) {
-        if ([x isKindOfClass:[NSString class]] && DidiIsOurName(x)) continue;
+        if ([x isKindOfClass:[NSString class]] &&
+            (DidiIsOurName(x) || [x.lowercaseString containsString:@"mobileprovision"])) continue;
+        [out addObject:x];
+    }
+    return out.count == arr.count ? arr : out;
+}
+static NSArray *hookedSubpathsOfDir(id self, SEL _cmd, NSString *path, NSError **err) {
+    typedef NSArray *(*o_t)(id, SEL, NSString *, NSError **);
+    NSArray *arr = ((o_t)g_origSubpathsOfDir)(self, _cmd, path, err);
+    if (!arr.count || !DidiInAppBundle(path)) return arr;
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:arr.count];
+    for (id x in arr) {
+        if ([x isKindOfClass:[NSString class]] &&
+            (DidiIsOurName(x) || [x.lowercaseString containsString:@"mobileprovision"])) continue;
         [out addObject:x];
     }
     return out.count == arr.count ? arr : out;
 }
 static BOOL hookedFileExists(id self, SEL _cmd, NSString *path) {
     typedef BOOL (*o_t)(id, SEL, NSString *);
-    if (DidiInAppBundle(path) && DidiIsOurName(path)) return NO;
+    if (DidiIsTraceFile(path) && DidiInAppBundle(path)) return NO;
+    if (DidiIsReceiptPath(path)) return YES;        // 官方包装机就有，侧载包没有 → 放行
     return ((o_t)g_origFileExists)(self, _cmd, path);
 }
+static BOOL hookedIsReadable(id self, SEL _cmd, NSString *path) {
+    typedef BOOL (*o_t)(id, SEL, NSString *);
+    if (DidiIsTraceFile(path) && DidiInAppBundle(path)) return NO;
+    if (DidiIsReceiptPath(path)) return YES;
+    return ((o_t)g_origIsReadable)(self, _cmd, path);
+}
+static NSData *hookedContentsAt(id self, SEL _cmd, NSString *path) {
+    typedef NSData *(*o_t)(id, SEL, NSString *);
+    if (DidiIsTraceFile(path) && DidiInAppBundle(path)) return nil;
+    if (DidiIsReceiptPath(path)) return DidiFakeReceiptData();
+    return ((o_t)g_origContentsAt)(self, _cmd, path);
+}
+static id hookedAttrOfItem(id self, SEL _cmd, NSString *path, NSError **err) {
+    typedef id (*o_t)(id, SEL, NSString *, NSError **);
+    if (DidiIsTraceFile(path) && DidiInAppBundle(path)) { if (err) *err = nil; return nil; }
+    if (DidiIsReceiptPath(path)) {
+        id a = [NSDictionary dictionaryWithObjectsAndKeys:
+                @(DidiFakeReceiptData().length), NSFileSize,
+                [NSDate dateWithTimeIntervalSince1970:1767225600], NSFileModificationDate, nil];
+        if (err) *err = nil;
+        return a;
+    }
+    return ((o_t)g_origAttrOfItem)(self, _cmd, path, err);
+}
+static NSData *hookedDataOfFile1(id self, SEL _cmd, NSString *path) {
+    typedef NSData *(*o_t)(id, SEL, NSString *);
+    if (DidiIsTraceFile(path) && DidiInAppBundle(path)) return nil;
+    if (DidiIsReceiptPath(path)) return DidiFakeReceiptData();
+    return ((o_t)g_origDataOfFile1)(self, _cmd, path);
+}
+static NSData *hookedDataOfFile2(id self, SEL _cmd, NSString *path, NSDataReadingOptions opt, NSError **err) {
+    typedef NSData *(*o_t)(id, SEL, NSString *, NSDataReadingOptions, NSError **);
+    if (DidiIsTraceFile(path) && DidiInAppBundle(path)) return nil;
+    if (DidiIsReceiptPath(path)) return DidiFakeReceiptData();
+    return ((o_t)g_origDataOfFile2)(self, _cmd, path, opt, err);
+}
+
 static void DidiHideDylibFromFS(void) {
     Class fm = NSClassFromString(@"NSFileManager");
     if (!fm) return;
     DidiHook(fm, NSSelectorFromString(@"contentsOfDirectoryAtPath:error:"),
              (IMP)hookedContentsOfDir, &g_origContentsOfDir);
+    DidiHook(fm, NSSelectorFromString(@"subpathsOfDirectoryAtPath:error:"),
+             (IMP)hookedSubpathsOfDir, &g_origSubpathsOfDir);
     DidiHook(fm, NSSelectorFromString(@"fileExistsAtPath:"),
              (IMP)hookedFileExists, &g_origFileExists);
-    NSLog(@"[Diditok] ✓ 文件系统枚举已过滤 Diditok");
+    DidiHook(fm, NSSelectorFromString(@"isReadableFileAtPath:"),
+             (IMP)hookedIsReadable, &g_origIsReadable);
+    DidiHook(fm, NSSelectorFromString(@"contentsAtPath:"),
+             (IMP)hookedContentsAt, &g_origContentsAt);
+    DidiHook(fm, NSSelectorFromString(@"attributesOfItemAtPath:error:"),
+             (IMP)hookedAttrOfItem, &g_origAttrOfItem);
+    Class dc = NSClassFromString(@"NSData");
+    if (dc) {
+        DidiHook(dc, @selector(dataWithContentsOfFile:),
+                 (IMP)hookedDataOfFile1, &g_origDataOfFile1);
+        DidiHook(dc, @selector(dataWithContentsOfFile:options:error:),
+                 (IMP)hookedDataOfFile2, &g_origDataOfFile2);
+    }
+    NSLog(@"[Diditok] ✓ 文件系统枚举已过滤 Diditok / mobileprovision");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 侧载身份三件套（宽松签/个人证书都中招）：
+//   1) 所有类的 getMobileProvision 一律返回 nil（官方 App Store 包无描述文件）
+//   2) appStoreReceiptURL 指向确实存在的假收据（官方包必有收据文件）
+//   3) CFBundleShortVersionString / infoDictionary → 伪装成 App Store 最新版
+// ═══════════════════════════════════════════════════════════════════════
+static IMP g_origGetProfileAt = NULL;
+
+static id hookedGetProvisionNil(id self) { return nil; }
+
+static void DidiHideProvisionReader(void) {
+    SEL sel = NSSelectorFromString(@"getMobileProvision");
+    int total = objc_getClassList(NULL, 0);
+    if (total <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)total);
+    if (!classes) return;
+    total = objc_getClassList(classes, total);
+    int hooked = 0;
+    for (int i = 0; i < total; i++) {
+        Class c = classes[i];
+        Method m = class_getInstanceMethod(c, sel);
+        if (m) {
+            const char *t = method_getTypeEncoding(m);
+            if (t && t[0] == '@') {                       // 返回对象类型才替换
+                g_origGetProfileAt = method_getImplementation(m);
+                method_setImplementation(m, (IMP)hookedGetProvisionNil);
+                hooked++;
+            }
+        }
+        Method cm = class_getClassMethod(c, sel);
+        if (cm) {
+            const char *t = method_getTypeEncoding(cm);
+            if (t && t[0] == '@') {
+                method_setImplementation(cm, (IMP)hookedGetProvisionNil);
+                hooked++;
+            }
+        }
+    }
+    free(classes);
+    NSLog(@"[Diditok] ✓ getMobileProvision 已归零 %d 处", hooked);
+}
+
+static NSURL *(*g_origReceiptURL)(id, SEL) = NULL;
+static NSURL *hookedReceiptURL(id self, SEL _cmd) {
+    NSURL *u = g_origReceiptURL ? g_origReceiptURL(self, _cmd) : nil;
+    BOOL exists = u && [[NSFileManager defaultManager] fileExistsAtPath:u.path ?: @""];
+    if (u && exists) return u;
+    // 官方包必有收据，侧载包没有 → 给一个真实存在的假收据路径
+    NSString *fake = [documentsDir() stringByAppendingPathComponent:@"dd_fake_receipt.bin"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:fake]) {
+        [DidiFakeReceiptData() writeToFile:fake options:NSDataWritingAtomically error:nil];
+    }
+    return [NSURL fileURLWithPath:fake];
+}
+
+static void DidiFakeReceipt(void) {
+    @try {
+        Class b = NSClassFromString(@"NSBundle");
+        if (!b) return;
+        // 先抓原生返回值，供 fileExists/读内容 hook 精确放行
+        @try { g_realReceiptPath = [NSBundle mainBundle].appStoreReceiptURL.path; } @catch (NSException *e) {}
+        Method m = class_getInstanceMethod(b, @selector(appStoreReceiptURL));
+        if (m) {
+            g_origReceiptURL = (NSURL *(*)(id, SEL))method_getImplementation(m);
+            method_setImplementation(m, (IMP)hookedReceiptURL);
+            NSLog(@"[Diditok] ✓ appStoreReceiptURL → 伪装收据  real=%@", g_realReceiptPath ?: @"(无)");
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[Diditok] ✗ fake receipt: %@", e);
+    }
+}
+
+static IMP g_origInfoKey = NULL;
+static id hookedInfoForKey(id self, SEL _cmd, NSString *key) {
+    id v = g_origInfoKey ? ((id(*)(id, SEL, NSString *))g_origInfoKey)(self, _cmd, key) : nil;
+    if ([key isKindOfClass:[NSString class]] &&
+        [key isEqualToString:@"CFBundleShortVersionString"] && v) {
+        return DIDITOK_SPOOF_VERSION;
+    }
+    return v;
+}
+static IMP g_origInfoDict = NULL;
+static id hookedInfoDict(id self, SEL _cmd) {
+    id d = g_origInfoDict ? ((id(*)(id, SEL))g_origInfoDict)(self, _cmd) : nil;
+    if ([d isKindOfClass:[NSDictionary class]]) {
+        id cur = ((NSDictionary *)d)[@"CFBundleShortVersionString"];
+        if ([cur isKindOfClass:[NSString class]] && [(NSString *)cur length] &&
+            ![(NSString *)cur isEqualToString:DIDITOK_SPOOF_VERSION]) {
+            NSMutableDictionary *m = [(NSDictionary *)d mutableCopy];
+            m[@"CFBundleShortVersionString"] = DIDITOK_SPOOF_VERSION;
+            return m;
+        }
+    }
+    return d;
+}
+static void DidiSpoofVersionStrings(void) {
+    Class b = NSClassFromString(@"NSBundle");
+    if (!b) return;
+    Method m1 = class_getInstanceMethod(b, @selector(objectForInfoDictionaryKey:));
+    if (m1) {
+        g_origInfoKey = method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)hookedInfoForKey);
+    }
+    Method m2 = class_getInstanceMethod(b, @selector(infoDictionary));
+    if (m2) {
+        g_origInfoDict = method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)hookedInfoDict);
+    }
+    NSLog(@"[Diditok] ✓ 版本伪装 CFBundleShortVersionString → %@", DIDITOK_SPOOF_VERSION);
 }
 
 // ⚠️ 这三层必须等 App 启动完再装。
@@ -1012,6 +1357,9 @@ static void DidiInstallGuards(void) {
     @try { DidiHideDylibFromFS();  } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hideFS: %@", e); }
     @try { DidiDisableAppAttest(); } @catch (NSException *e) { NSLog(@"[Diditok] ✗ attest: %@", e); }
     @try { DidiSuppressIntegrityFlags(); } @catch (NSException *e) { NSLog(@"[Diditok] ✗ flags: %@", e); }
+    @try { DidiHideProvisionReader(); } @catch (NSException *e) { NSLog(@"[Diditok] ✗ profile: %@", e); }
+    @try { DidiFakeReceipt();        } @catch (NSException *e) { NSLog(@"[Diditok] ✗ receipt: %@", e); }
+    @try { DidiSpoofVersionStrings(); } @catch (NSException *e) { NSLog(@"[Diditok] ✗ version: %@", e); }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1022,7 +1370,6 @@ static void diditok_init(void) {
     @autoreleasepool {
       @try {
         NSLog(@"[Diditok] ▶ constructor fired");
-#if !DIDITOK_TEST_MODE
         DidiHideSelf();
 
         g_harLock    = [NSLock new];
@@ -1082,7 +1429,6 @@ static void diditok_init(void) {
         } @catch (NSException *e) {
             NSLog(@"[Diditok] ✗ AES self-test FAILED: %@", e);
         }
-#endif  // !DIDITOK_TEST_MODE
 
         // 等 App 完全启动后再建 UIWindow
         g_launchObserver = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
@@ -1090,14 +1436,14 @@ static void diditok_init(void) {
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification *note) {
             NSLog(@"[Diditok] ▶ UIApplicationDidFinishLaunching → setupFloatUI");
-            if (!DIDITOK_TEST_MODE) DidiInstallGuards();
+            DidiInstallGuards();
             setupFloatUI();
         }];
 
         // 兜底：如果通知没触发（罕见），3 秒后强制
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3000000000)),
                        dispatch_get_main_queue(), ^{
-            if (!DIDITOK_TEST_MODE) DidiInstallGuards();
+            DidiInstallGuards();
             setupFloatUI();
         });
 

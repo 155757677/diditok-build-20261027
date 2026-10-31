@@ -351,6 +351,7 @@ static void scanHeaders(NSURLRequest *req, NSString *src, NSURLSessionTask *task
 }
 
 
+static UIWindow *appWindow(void);
 static UIViewController *topVC(void);
 // ═══════════════════════════════════════════════════════════════════════
 // UI 事件 target（ObjC 方法，避免 addTarget:nil 野指针）
@@ -370,6 +371,7 @@ static UIViewController *topVC(void);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *vc = topVC();
+        if (!vc || !vc.view.window) vc = appWindow().rootViewController;
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Diditok"
                                                                     message:nil
                                                              preferredStyle:UIAlertControllerStyleActionSheet];
@@ -519,8 +521,38 @@ static NSString* hookedUserPhone(id self, SEL _cmd) {
 // 悬浮 UI
 // ═══════════════════════════════════════════════════════════════════════
 
+@interface DiditokFloatWindow : UIWindow
+@end
+
+@implementation DiditokFloatWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = [super hitTest:point withEvent:event];
+    return (v == self) ? nil : v;
+}
+@end
+
+static UIWindow *appWindow(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *s in app.connectedScenes) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            if (s.activationState != UISceneActivationStateForegroundActive) continue;
+            for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                if (w != g_floatWindow && w.isKeyWindow) return w;
+            }
+        }
+        for (UIScene *s in app.connectedScenes) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                if (w != g_floatWindow) return w;
+            }
+        }
+    }
+    return app.keyWindow;
+}
+
 static UIViewController *topVC(void) {
-    UIWindow *kw = [UIApplication sharedApplication].keyWindow;
+    UIWindow *kw = appWindow();
     UIViewController *vc = kw.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
@@ -531,7 +563,7 @@ static void setupFloatUI(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (g_floatWindow) return;
         UIScreen *sc = [UIScreen mainScreen];
-        g_floatWindow = [[UIWindow alloc] initWithFrame:sc.bounds];
+        g_floatWindow = [[DiditokFloatWindow alloc] initWithFrame:sc.bounds];
         g_floatWindow.windowLevel = UIWindowLevelStatusBar + 1;
         g_floatWindow.backgroundColor = [UIColor clearColor];
         g_floatWindow.hidden = NO;
@@ -563,6 +595,7 @@ static void setupFloatUI(void) {
         g_toastLabel.layer.cornerRadius = 22;
         g_toastLabel.layer.masksToBounds = YES;
         g_toastLabel.alpha = 0;
+        g_toastLabel.userInteractionEnabled = NO;
         [g_floatWindow addSubview:g_toastLabel];
         NSLog(@"[Diditok] ✓ 悬浮 UI ready");
     });

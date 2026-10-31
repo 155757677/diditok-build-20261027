@@ -581,7 +581,7 @@ static void setupFloatUI(void) {
         g_floatButton.layer.borderWidth  = 2;
         g_floatButton.layer.borderColor  = [UIColor whiteColor].CGColor;
         g_floatButton.backgroundColor    = [UIColor colorWithRed:0.2 green:0.4 blue:0.9 alpha:0.9];
-        [g_floatButton setTitle:@"T" forState:UIControlStateNormal];
+        [g_floatButton setTitle:@"梦" forState:UIControlStateNormal];
         [g_floatButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         g_floatButton.titleLabel.font = [UIFont boldSystemFontOfSize:28];
         [g_floatButton addTarget:[DiditokActionTarget shared] action:@selector(onFloatTap) forControlEvents:UIControlEventTouchUpInside];

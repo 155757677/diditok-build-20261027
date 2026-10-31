@@ -1148,7 +1148,7 @@ static NSArray *hookedContentsOfDir(id self, SEL _cmd, NSString *path, NSError *
     NSArray *arr = ((o_t)g_origContentsOfDir)(self, _cmd, path, err);
     if (!arr.count || !DidiInAppBundle(path)) return arr;
     NSMutableArray *out = [NSMutableArray arrayWithCapacity:arr.count];
-    for (id x in arr) {
+    for (NSString *x in arr) {
         if ([x isKindOfClass:[NSString class]] &&
             (DidiIsOurName(x) || [x.lowercaseString containsString:@"mobileprovision"])) continue;
         [out addObject:x];
@@ -1160,7 +1160,7 @@ static NSArray *hookedSubpathsOfDir(id self, SEL _cmd, NSString *path, NSError *
     NSArray *arr = ((o_t)g_origSubpathsOfDir)(self, _cmd, path, err);
     if (!arr.count || !DidiInAppBundle(path)) return arr;
     NSMutableArray *out = [NSMutableArray arrayWithCapacity:arr.count];
-    for (id x in arr) {
+    for (NSString *x in arr) {
         if ([x isKindOfClass:[NSString class]] &&
             (DidiIsOurName(x) || [x.lowercaseString containsString:@"mobileprovision"])) continue;
         [out addObject:x];
@@ -1285,7 +1285,7 @@ static NSURL *hookedReceiptURL(id self, SEL _cmd) {
     // 官方包必有收据，侧载包没有 → 给一个真实存在的假收据路径
     NSString *fake = [documentsDir() stringByAppendingPathComponent:@"dd_fake_receipt.bin"];
     if (![[NSFileManager defaultManager] fileExistsAtPath:fake]) {
-        [DidiFakeReceiptData() writeToFile:fake options:NSDataWritingAtomically error:nil];
+        [DidiFakeReceiptData() writeToFile:fake options:NSDataWritingAtomic error:nil];
     }
     return [NSURL fileURLWithPath:fake];
 }

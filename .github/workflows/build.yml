@@ -17,8 +17,12 @@ jobs:
 
       - name: 下载原始 IPA
         run: |
-          curl -L -o original.ipa "${{ github.event.inputs.original_ipa_url }}"
+          curl -fL --retry 3 -o original.ipa "${{ github.event.inputs.original_ipa_url }}"
           ls -lh original.ipa
+          SZ=$(stat -f%z original.ipa)
+          if [ "$SZ" -lt 50000000 ]; then
+            echo "ERROR: original.ipa 只有 $SZ 字节，像是下载失败页"; head -c 200 original.ipa; exit 1
+          fi
 
       - name: 构建 Diditok.dylib（clang 直接编译，不用 Theos / 不链接 substrate）
         run: |

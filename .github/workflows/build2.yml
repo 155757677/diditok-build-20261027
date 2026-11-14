@@ -1,0 +1,114 @@
+name: Build Diditok Injection IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      original_ipa_url:
+        description: "原始滴滴 IPA 下载直链"
+        required: true
+        default: ""
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout 仓库
+        uses: actions/checkout@v4
+
+      - name: 下载原始 IPA
+        run: |
+          curl -L -o original.ipa "${{ github.event.inputs.original_ipa_url }}"
+          ls -lh original.ipa
+
+      - name: 构建 Diditok.dylib（clang 直接编译，不用 Theos / 不链接 substrate）
+        run: |
+          set -e
+          SDK=$(xcrun -sdk iphoneos --show-sdk-path)
+          mkdir -p out
+          xcrun -sdk iphoneos clang \
+            -arch arm64 -arch arm64e \
+            -mios-version-min=13.4 \
+            -dynamiclib -fobjc-arc -O2 \
+            -isysroot "$SDK" \
+            -framework Foundation -framework UIKit -framework Security -framework QuartzCore \
+            -undefined dynamic_lookup \
+            Tweak/MyTweak.m -o out/Diditok.dylib
+          lipo -info out/Diditok.dylib
+          ls -lh out/Diditok.dylib
+          echo "=== 检查是否残留 substrate 符号（必须为空）==="
+          if strings out/Diditok.dylib | grep -q "MSHookMessageEx"; then
+            echo "ERROR: still depends on substrate"
+            exit 1
+          fi
+          echo "OK: 无 substrate 依赖"
+          echo "=== 依赖库 ==="
+          otool -L out/Diditok.dylib
+
+      - name: 注入 + 自签 + 重打包
+        run: |
+          set -e
+          pip3 install lief --break-system-packages 2>/dev/null || pip install lief
+          unzip -q original.ipa -d ipa_extracted
+          APP_DIR=$(find ipa_extracted/Payload -maxdepth 2 -name "*.app" -type d | head -1)
+          echo "App dir: $APP_DIR"
+          BIN_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_DIR/Info.plist")
+          echo "Binary: $BIN_NAME"
+          BIN_PATH="$APP_DIR/$BIN_NAME"
+
+          # ⚠️ 关键：必须在 LIEF 改动前，把主二进制的原始 entitlements 备份出来。
+          # 之前用 codesign --force --deep --sign - 重签把 entitlements 全部抹掉了
+          # （keychain-access-groups / application-identifier / aps-environment 全没了），
+          # 滴滴的 WSG 安全 SDK 拿不到这些就直接判定「非官方或低版本」。
+          codesign -d --entitlements :- "$BIN_PATH" > ent.plist 2>/dev/null || true
+          echo "=== 原始 entitlements ==="
+          cat ent.plist || true
+          # 有些包（比如哈啰）可能没有 entitlements，此时重签不附加即可，不中止
+          ENT_ARGS=""
+          if grep -q "application-identifier" ent.plist; then
+            ENT_ARGS="--entitlements ent.plist"
+          else
+            echo "WARN: 原始包没有 entitlements，重签时不附加"
+          fi
+
+          mkdir -p "$APP_DIR/Frameworks"
+          cp out/Diditok.dylib "$APP_DIR/Frameworks/"
+          python3 inject.py "$BIN_PATH"
+
+          # 新加的 dylib 不需要 entitlements
+          codesign --force --sign - "$APP_DIR/Frameworks/Diditok.dylib"
+          # 主二进制带着原始 entitlements 重签；不要用 --deep（会递归重签并清空嵌套项）
+          codesign --force --sign - $ENT_ARGS "$BIN_PATH"
+          # 签整个 .app（不加 --deep，嵌套的框架保持它们原来的签名不动）
+          codesign --force --sign - $ENT_ARGS "$APP_DIR"
+
+          echo "=== 重签后 entitlements 校验 ==="
+          if [ -n "$ENT_ARGS" ]; then
+            codesign -d --entitlements :- "$BIN_PATH" > after.plist 2>/dev/null || true
+            if grep -q "keychain-access-groups" after.plist && grep -q "application-identifier" after.plist; then
+              echo "OK: entitlements 完整保留"
+            else
+              echo "ERROR: entitlements 丢失"; cat after.plist; exit 1
+            fi
+          else
+            echo "OK: 原始包无 entitlements，跳过该检查"
+          fi
+
+          cd ipa_extracted && zip -qr ../diditok-injected.ipa Payload && cd ..
+          ls -lh diditok-injected.ipa
+
+      - name: 校验产物
+        run: |
+          unzip -l diditok-injected.ipa | grep -i Diditok || (echo "ERROR: dylib missing"; exit 1)
+          rm -rf verify && unzip -q diditok-injected.ipa -d verify
+          APP_DIR=$(find verify/Payload -maxdepth 2 -name "*.app" -type d | head -1)
+          BIN_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_DIR/Info.plist")
+          B="$APP_DIR/$BIN_NAME"
+          echo "binary: $B"
+          otool -L "$B" | grep -i Diditok || (echo "ERROR: load command missing"; exit 1)
+          echo "OK: 已注入"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: diditok-injected-ipa
+          path: diditok-injected.ipa

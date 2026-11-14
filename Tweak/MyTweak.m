@@ -1,24 +1,29 @@
-// MyTweak.m —— 滴滴 iOS Diditok Tweak
+// MyTweak.m —— Diditok Tweak（纯抓包版，通用 App）
 //
-// 菜单（点右下角悬浮 "T" 按钮）：
-//   1. 🔐 复制密文            免密码，AES-CBC 与 Android TkHook 逐字节一致
-//   2. 👁️ 查看/复制明文       必须输密码 18075893937，错密码拒绝；明文只显示不写盘
-//   3. 💾 保存/分享密文       写 diditok.txt 后直接弹系统分享面板，绝不写明文
-//   4. 📡 抓包控制            子菜单：开始抓包 / 停止抓包 / 分享导出（导出即清空缓冲）
-//   5. ❌ 取消
+// 悬浮球「抓」（右下角，可拖动），点开菜单：
+//   ▶️ 开始抓包    清空记录，重写 diditok_capture.txt 重新开始
+//   ⏹ 停止抓包    停止记录（进行中的请求会记完整条再落盘）
+//   📤 分享导出    把 diditok_capture.txt 弹系统分享面板（微信/AirDrop/存储到文件…）
+//   ❌ 取消
 //
-// 加密格式（与 Android TkHook 完全一致）：
-//   JSON {Phone, token, auToken, ddfp}
-//   AES-128-CBC / PKCS7 / key="MFY-TK-ENC-2026!"(16B UTF-8) / IV=0x00×16
-//   Base64 NO_WRAP
+// 抓包内容（全量，TXT 逐条追加，UTF-8）：
+//   · 请求：方法 / URL / HTTP 版本 / 超时 / 全部请求头（含 User-Agent）/ 请求体
+//   · 响应：状态码 / 全部响应头 / MIME / 响应体
+//   · 其他：耗时、错误、重定向链、下载落盘路径、流式上传提示
+//   · 响应体三条路都覆盖：completionHandler 包装 / session 代理回调 / KVO 兜底
+//   · 单个体上限 16 MB，超出截断并标注（防撑爆内存/文件）
 //
-// 沙盒 Documents/ 输出（无明文！）：
-//   diditok.txt       — 密文一行
-//   diditok_full.har  — Proxyman HAR 1.2 抓包
+// 沙盒 Documents/ 输出：
+//   diditok_capture.txt —— 全量抓包记录；「分享导出」直接分享这个文件
+//
+// 实现要点：
+//   · 不依赖 Cydia Substrate，全部用 ObjC runtime method_setImplementation
+//   · session 代理用 NSProxy 包装转发，不 hook 任何业务类
+//   · 反检测保留（镜像隐藏 / 完整性开关压平 / 文件枚举过滤），保证 App 正常运行
+//   · 已移除：凭据提取、AES 加密、密码门控、NSJSONSerialization / UserInfoCallback 钩子
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <CommonCrypto/CommonCryptor.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -40,311 +45,178 @@ static BOOL DidiHook(Class cls, SEL sel, IMP newImp, IMP *outOld) {
     return YES;
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════
-// 常量
+// 常量与状态
 // ═══════════════════════════════════════════════════════════════════════
-static const char *kAesKey   = "MFY-TK-ENC-2026!";
-static const int   kAesKeyLen = 16;
-static const int   kAesIvLen  = 16;
-#define DIDITOK_PASSWORD   @"18075893937"
-// 版本伪装：App Store 上最新是 8.0.18（2026-10-29 上架），登录侧「非官方或低版本」
-// 有版本门控分支 —— 上报时按新版报，Original 包再新一键构建时若版本数字更大则自动跳过伪装。
-#define DIDITOK_SPOOF_VERSION @"8.0.18"
+#define DIDITOK_CAPTURE_FILE @"diditok_capture.txt"
+static const NSUInteger kMaxBodyBytes = 16 * 1024 * 1024;   // 单条请求/响应体上限
 
-// ═══════════════════════════════════════════════════════════════════════
-// 状态
-// ═══════════════════════════════════════════════════════════════════════
-static NSString *g_lastAuToken   = nil;
-static NSString *g_lastDdfp      = nil;
-static NSString *g_lastDeviceId  = nil;
-static NSString *g_lastToken     = nil;
-static NSString *g_lastPhone     = nil;
+static BOOL  g_captureEnabled = NO;
+static int   g_seq   = 0;
+static int   g_count = 0;
+static NSLock *g_stateLock;      // g_captureEnabled / g_seq / g_count
+static NSLock *g_mapLock;        // g_pendingMap / g_bodyMap / entry 收尾标记
 
-static BOOL       g_captureEnabled = NO;
-static NSMutableArray *g_harEntries;
-static NSLock     *g_harLock;
-static int        g_harSeq = 0;
+static NSMutableDictionary *g_pendingMap;  // task指针 → entry（进行中的请求）
+static NSMutableDictionary *g_bodyMap;     // task指针 → NSMutableData（代理路径响应体累积）
 
-static NSRegularExpression *g_reAu;
+static dispatch_queue_t g_writeQueue;      // 串行写文件，保证条目顺序
 
-static UIWindow   *g_floatWindow = nil;
-static UIButton   *g_floatButton = nil;
-static UILabel    *g_toastLabel  = nil;
+static UIWindow *g_floatWindow = nil;
+static UIButton *g_floatButton = nil;
+static UILabel  *g_toastLabel  = nil;
 
-static IMP g_origDataTask1 = NULL;
-static IMP g_origDataTask2 = NULL;
-static IMP g_origUserToken = NULL;
-static IMP g_origUserPhone = NULL;
-static IMP g_origJSON      = NULL;
-
-static NSMutableDictionary *g_pendingHarMap;
+static IMP g_origDataTaskCH     = NULL;  // dataTaskWithRequest:completionHandler:
+static IMP g_origDataTaskNH     = NULL;  // dataTaskWithRequest:
+static IMP g_origDataTaskURLCH  = NULL;  // dataTaskWithURL:completionHandler:
+static IMP g_origDataTaskURLNH  = NULL;  // dataTaskWithURL:
+static IMP g_origUploadDataCH   = NULL;  // uploadTaskWithRequest:fromData:completionHandler:
+static IMP g_origUploadDataNH   = NULL;  // uploadTaskWithRequest:fromData:
+static IMP g_origUploadStream   = NULL;  // uploadTaskWithStreamedRequest:
+static IMP g_origDownloadCH     = NULL;  // downloadTaskWithRequest:completionHandler:
+static IMP g_origDownloadURLCH  = NULL;  // downloadTaskWithURL:completionHandler:
+static IMP g_origDownloadNH     = NULL;  // downloadTaskWithRequest:
+static IMP g_origSessionDQ      = NULL;  // sessionWithConfiguration:delegate:delegateQueue:
+static IMP g_origSessionD       = NULL;  // sessionWithConfiguration:delegate:
+static IMP g_origBgSessionDQ    = NULL;  // backgroundSessionWithConfiguration:delegate:delegateQueue:
 
 static id g_launchObserver = nil;
 
-// ═══════════════════════════════════════════════════════════════════════
-// 前向声明（定义在后面）
-// ═══════════════════════════════════════════════════════════════════════
-static NSDictionary *harResponseFrom(NSURLResponse *resp, NSData *body, NSTimeInterval timingMs);
-static void DidiDiagAppend(NSString *text);   // 诊断日志（定义在 writeCipherOnly 之后）
-static NSString *diagLogPath(void);
-static void shareFileNow(NSString *path);     // 定义在 topVC() 之后
+// 前置声明
+static NSMutableDictionary *maybeCapture(NSURLRequest *req, NSURLSessionTask *task,
+                                         NSData *uploadBody, NSString *note, BOOL willSelfFinalize);
+static void finalizeEntry(NSMutableDictionary *entry, NSData *respBody, NSError *err, NSString *extra);
+static void noteEntry(NSURLSessionTask *task, NSString *note);
+static void setRespFromResponse(NSMutableDictionary *entry, NSURLResponse *resp);
+static UIWindow *appWindow(void);
+static UIViewController *topVC(void);
 
 // ═══════════════════════════════════════════════════════════════════════
-// KVO 接收
+// 基础工具
 // ═══════════════════════════════════════════════════════════════════════
-@interface DiditokKvo : NSObject
-+ (instancetype)shared;
-@end
-@implementation DiditokKvo
-+ (instancetype)shared {
-    static DiditokKvo *inst; static dispatch_once_t t;
-    dispatch_once(&t, ^{ inst = [DiditokKvo new]; });
-    return inst;
-}
-- (void)observeValueForKeyPath:(NSString *)kp ofObject:(id)obj
-                        change:(NSDictionary *)change context:(void *)ctx {
-    if (![obj isKindOfClass:[NSURLSessionTask class]]) return;
-    NSURLSessionTask *task = obj;
-    NSValue *k = [NSValue valueWithPointer:(__bridge const void *)task];
-    NSDictionary *entry = g_pendingHarMap[k];
-    if (!entry) return;
-
-    if ([kp isEqualToString:@"response"] && task.response) {
-        [entry setValue:harResponseFrom(task.response, nil, 0) forKey:@"response"];
-    }
-    if ([kp isEqualToString:@"state"] && task.state == NSURLSessionTaskStateCompleted) {
-        @try { [task removeObserver:self forKeyPath:@"response"]; } @catch (NSException *e) {}
-        @try { [task removeObserver:self forKeyPath:@"state"];    } @catch (NSException *e) {}
-        [g_pendingHarMap removeObjectForKey:k];
-        double ms = [[NSDate date] timeIntervalSinceDate:
-                     (task.earliestBeginDate ?: [NSDate date])] * 1000.0;
-        [entry setValue:@((int)(ms + 0.5)) forKey:@"time"];
-        [entry setValue:@{@"send":@0, @"wait":@((int)(ms+0.5)), @"receive":@0,
-                          @"dns":@-1, @"connect":@-1, @"ssl":@-1, @"blocked":@-1}
-                 forKey:@"timings"];
-    }
-}
-@end
-
-// ═══════════════════════════════════════════════════════════════════════
-// AES 工具
-// ═══════════════════════════════════════════════════════════════════════
-static NSData *pkcs7Pad(NSData *data, int bs) {
-    NSUInteger len = data.length;
-    int pad = bs - ((int)len % bs);
-    if (pad == 0) pad = bs;
-    NSMutableData *out = [NSMutableData dataWithData:data];
-    unsigned char b = (unsigned char)pad;
-    for (int i = 0; i < pad; i++) [out appendBytes:&b length:1];
-    return out;
-}
-static NSString *aesEncryptString(NSString *plaintext) {
-    NSData *plain = [plaintext dataUsingEncoding:NSUTF8StringEncoding];
-    NSData *padded = pkcs7Pad(plain, 16);
-    unsigned char k[kAesKeyLen]; memcpy(k, kAesKey, kAesKeyLen);
-    unsigned char iv[kAesIvLen];  memset(iv, 0, kAesIvLen);
-    NSUInteger outSize = padded.length + 16;
-    void *outBuf = malloc(outSize);
-    size_t moved = 0;
-    // ⚠️ CCCrypt 是 3 个 C！不是 4 个
-    CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionPKCS7Padding,
-            k, kAesKeyLen, iv, padded.bytes, padded.length,
-            outBuf, outSize, &moved);
-    NSData *ct = [NSData dataWithBytes:outBuf length:moved];
-    free(outBuf);
-    return [ct base64EncodedStringWithOptions:0];
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// 凭据 JSON
-// ═══════════════════════════════════════════════════════════════════════
-static NSString *buildPlainJSON(void) {
-    NSMutableDictionary *d = [NSMutableDictionary new];
-    d[@"Phone"]   = g_lastPhone.length ? [@"苹果端" stringByAppendingString:g_lastPhone] : @"";
-    d[@"token"]   = g_lastToken   ?: @"";
-    d[@"auToken"] = g_lastAuToken ?: @"";
-    d[@"ddfp"]    = g_lastDdfp    ?: (g_lastDeviceId ?: @"");
-    NSError *err;
-    NSData *data = [NSJSONSerialization dataWithJSONObject:d options:0 error:&err];
-    if (!data) return @"{}";
-    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-}
-static NSString *buildCipherText(void) { return aesEncryptString(buildPlainJSON()); }
 static NSString *documentsDir(void) {
     return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
 }
-static void writeCipherOnly(void) {
-    @autoreleasepool {
-        NSString *ct = buildCipherText();
-        [ct writeToFile:[documentsDir() stringByAppendingPathComponent:@"diditok.txt"]
-             atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        NSLog(@"[Diditok] ✓ 密文写入 Documents/diditok.txt");
-    }
+static NSString *captureFilePath(void) {
+    return [documentsDir() stringByAppendingPathComponent:DIDITOK_CAPTURE_FILE];
 }
-
-// ═══════════════════════════════════════════════════════════════════════
-// 诊断日志：把「版本 / 风控 / 非官方」相关请求与响应原文写进本地
-//   Documents/diditok_risk.log
-// 只用于排查登录时「非官方或低版本」弹窗的来源：不自动上传，
-// 用户在悬浮球菜单里点「导出诊断日志」手动拿到。
-// ═══════════════════════════════════════════════════════════════════════
-static NSLock     *g_diagLock    = nil;
-static NSUInteger  g_diagCount   = 0;
-static const NSUInteger kDiagMaxEntries = 300;
-
-static NSString *diagLogPath(void) {
-    return [documentsDir() stringByAppendingPathComponent:@"diditok_risk.log"];
-}
-
-static void DidiDiagAppend(NSString *text) {
-    if (!text.length) return;
-    if (!g_diagLock) g_diagLock = [NSLock new];
-    [g_diagLock lock];
-    @try {
-        if (g_diagCount < kDiagMaxEntries) {
-            g_diagCount++;
-            NSString *path = diagLogPath();
-            NSFileManager *fm = [NSFileManager defaultManager];
-            if (![fm fileExistsAtPath:path]) {
-                [@"Diditok 诊断日志（只存本机，导出后手动发送）\n"
-                    writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-            }
-            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-            if (fh) {
-                [fh seekToEndOfFile];
-                NSData *d = [text dataUsingEncoding:NSUTF8StringEncoding];
-                if (d) [fh writeData:d];
-                [fh closeFile];
-            }
-        }
-    } @finally {
-        [g_diagLock unlock];
-    }
-}
-
-static BOOL DidiDiagInterestingText(NSString *s) {
-    if (!s.length) return NO;
-    if (s.length > 256 * 1024) return NO;
-    static NSArray *k; static dispatch_once_t once;
+static NSString *tsStr(NSDate *d) {
+    static NSDateFormatter *df; static dispatch_once_t once;
     dispatch_once(&once, ^{
-        k = @[@"非官方", @"版本过低", @"官方APP", @"官方APP",
-              @"attest", @"Attest", @"is_cracked", @"isCracked", @"jailbreak",
-              @"version_code", @"app_version", @"appversion", @"min_version",
-              @"minVersion", @"force_update", @"forceUpdate",
-              @"risk_level", @"riskLevel", @"wsgsig", @"wsgenv", @"device_token"];
+        df = [NSDateFormatter new];
+        df.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+        df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
     });
-    for (NSString *w in k) {
-        if ([s rangeOfString:w].location != NSNotFound) return YES;
+    if (!d) return @"—";
+    NSTimeInterval ti = d.timeIntervalSince1970;
+    int ms = (int)((ti - floor(ti)) * 1000.0);
+    return [NSString stringWithFormat:@"%@.%03d", [df stringFromDate:d], ms];
+}
+static NSString *sizeStr(NSUInteger n) {
+    if (n >= 1024 * 1024) return [NSString stringWithFormat:@"%.1f MB", n / 1024.0 / 1024.0];
+    if (n >= 1024)        return [NSString stringWithFormat:@"%.1f KB", n / 1024.0];
+    return [NSString stringWithFormat:@"%lu B", (unsigned long)n];
+}
+// header 名大小写不敏感取值（allHTTPHeaderFields 的键大小写不保证）
+static NSString *headerValue(NSDictionary *hdrs, NSString *name) {
+    NSString *v = hdrs[name];
+    if (v.length) return [v isKindOfClass:[NSString class]] ? v : [v description];
+    for (NSString *k in hdrs) {
+        if ([k caseInsensitiveCompare:name] == NSOrderedSame) {
+            id o = hdrs[k];
+            return [o isKindOfClass:[NSString class]] ? o : [o description];
+        }
     }
-    return NO;
+    return nil;
+}
+static NSString *headersText(NSDictionary *hdrs) {
+    NSMutableString *s = [NSMutableString new];
+    NSArray *keys = [hdrs.allKeys sortedArrayUsingSelector:@selector(caseInsensitiveCompare:)];
+    for (NSString *k in keys) {
+        id v = hdrs[k];
+        [s appendFormat:@"  %@: %@\n", k, [v isKindOfClass:[NSString class]] ? v : [v description]];
+    }
+    return s;
+}
+// 请求/响应体渲染：能转 UTF-8 就直接放文本，二进制给 Base64 预览
+static NSString *bodyText(NSData *body, BOOL truncated) {
+    if (!body.length) return @"（无）";
+    NSMutableString *s = [NSMutableString new];
+    NSString *asText = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+    if (asText) {
+        [s appendString:asText];
+    } else {
+        NSUInteger preview = MIN(body.length, (NSUInteger)262144);
+        NSData *p = [body subdataWithRange:NSMakeRange(0, preview)];
+        [s appendFormat:@"【二进制数据，Base64 预览 %@ / 完整 %@】\n%@",
+            sizeStr(preview), sizeStr(body.length), [p base64EncodedStringWithOptions:0]];
+    }
+    if (truncated) [s appendFormat:@"\n⚠️ 超过 %@ 上限，已截断", sizeStr(kMaxBodyBytes)];
+    return s;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// 请求环缓冲：记录最近 12 个 URLSession 请求的 URL + 安全头（wsgsig/wsgenv）
-// 命中 58103/非官方 时把快照丢进诊断日志 → 直接判定「签名缺失」还是「签名在场仍被拒」
+// TXT 条目渲染
 // ═══════════════════════════════════════════════════════════════════════
-#define DIDI_RING_N 12
-static NSString *g_ringURL[DIDI_RING_N];
-static NSString *g_ringSig[DIDI_RING_N];
-static NSString *g_ringEnv[DIDI_RING_N];
-static int  g_ringIdx   = 0;
-static int  g_ringCount = 0;
-static NSLock *g_ringLock = nil;
+static NSString *renderEntry(NSDictionary *e) {
+    NSMutableString *s = [NSMutableString new];
+    NSDictionary *reqH = e[@"reqHeaders"] ?: @{};
+    NSDictionary *rspH = e[@"respHeaders"] ?: @{};
+    NSData *reqB = e[@"reqBody"];
+    NSData *rspB = e[@"respBody"];
 
-static void DidiRingPush(NSURLRequest *req) {
-    if (!req) return;
-    if (!g_ringLock) g_ringLock = [NSLock new];
-    NSString *url = req.URL.absoluteString ?: @"";
-    if (!url.length) return;
-    NSDictionary *h = req.allHTTPHeaderFields;
-    NSString *sig = [h objectForKey:@"wsgsig"] ?: @"";
-    NSString *env = [h objectForKey:@"wsgenv"] ?: @"";
-    [g_ringLock lock];
-    @try {
-        g_ringURL[g_ringIdx] = url;
-        g_ringSig[g_ringIdx] = sig;
-        g_ringEnv[g_ringIdx] = env;
-        g_ringIdx = (g_ringIdx + 1) % DIDI_RING_N;
-        if (g_ringCount < DIDI_RING_N) g_ringCount++;
-    } @finally { [g_ringLock unlock]; }
-}
+    [s appendString:@"════════════════════════════════════════════════\n"];
+    [s appendFormat:@"[#%d] %@  %@  %@\n",
+        [e[@"seq"] intValue], tsStr(e[@"start"]), e[@"method"], e[@"url"]];
+    NSString *ua = headerValue(reqH, @"User-Agent");
+    if (ua.length) [s appendFormat:@"UA  : %@\n", ua];
+    [s appendFormat:@"耗时: %.0f ms   结束: %@\n", [e[@"ms"] doubleValue], tsStr(e[@"end"])];
+    if ([e[@"statusCode"] intValue] > 0)
+        [s appendFormat:@"状态: %@   MIME: %@\n", e[@"statusCode"], e[@"respMime"] ?: @""];
 
-static NSString *DidiRingDump(void) {
-    if (!g_ringLock) return @"<ring empty>";
-    [g_ringLock lock];
-    @try {
-        int n = g_ringCount;
-        if (!n) { return @"<ring empty>"; }
-        NSMutableString *s = [NSMutableString string];
-        for (int k = n; k >= 1; k--) {
-            int i = ((g_ringIdx - k) % DIDI_RING_N + DIDI_RING_N) % DIDI_RING_N;
-            NSString *sig = g_ringSig[i] ?: @"";
-            NSString *env = g_ringEnv[i] ?: @"";
-            [s appendFormat:@"  req[-%d] %@\n", k - 1, g_ringURL[i] ?: @""];
-            if (sig.length) [s appendFormat:@"      wsgsig(%lu)=%@\n",
-                              (unsigned long)sig.length, [sig substringToIndex:MIN((NSUInteger)90, sig.length)]];
-            else           [s appendFormat:@"      wsgsig=ABSENT!\n"];
-            if (env.length) [s appendFormat:@"      wsgenv(%lu)=%@\n",
-                             (unsigned long)env.length, [env substringToIndex:MIN((NSUInteger)90, env.length)]];
-            else            [s appendFormat:@"      wsgenv=ABSENT!\n"];
-        }
-        return s;
-    } @finally { [g_ringLock unlock]; }
-}
-
-static void DidiDiagRingIfRejected(NSString *body) {
-    @try {
-        if (body.length &&
-            ([body containsString:@"58103"] || [body containsString:@"非官方"])) {
-            DidiDiagAppend([NSString stringWithFormat:
-                @"\n===== [ring] 拒绝时刻最近请求快照 =====\n%@\n", DidiRingDump()]);
-        }
-    } @catch (NSException *e) {}
-}
-
-// 记录「URL 命中关键词 或 响应体含可疑字段」的请求。
-static void DidiDiagNetwork(NSURLRequest *req, NSURLResponse *resp, NSData *body) {
-    @autoreleasepool {
-        if (!req) return;
-        NSString *url = req.URL.absoluteString ?: @"";
-        if (!url.length) return;
-        NSString *lu = url.lowercaseString;
-        BOOL urlHit = NO;
-        for (NSString *w in @[@"version", @"risk", @"attest", @"passport", @"login",
-                               @"/conf", @"security."]) {
-            if ([lu containsString:w]) { urlHit = YES; break; }
-        }
-        NSString *text = @"";
-        if (body.length) {
-            NSData *t = body.length > 16384 ? [body subdataWithRange:NSMakeRange(0, 16384)] : body;
-            text = [[NSString alloc] initWithData:t encoding:NSUTF8StringEncoding]
-                   ?: [NSString stringWithFormat:@"<binary %@ bytes>", @(body.length)];
-        }
-        if (!urlHit && !DidiDiagInterestingText(text)) return;
-        NSInteger st = 0;
-        if ([resp isKindOfClass:[NSHTTPURLResponse class]]) st = ((NSHTTPURLResponse *)resp).statusCode;
-        NSString *line = [NSString stringWithFormat:@"\n===== %@  [HTTP:%ld] %@ =====\n%@\n",
-                          [NSDate date], (long)st, url, text.length ? text : @"<无响应体>"];
-        if (line.length > 20000) line = [line substringToIndex:20000];
-        DidiDiagAppend(line);
+    [s appendFormat:@"────────────── 请求头 (%lu 个) ──────────────\n", (unsigned long)reqH.count];
+    [s appendString:headersText(reqH)];
+    if (reqB.length) {
+        [s appendFormat:@"────────────── 请求体 (%@) ──────────────\n", sizeStr(reqB.length)];
+        [s appendString:bodyText(reqB, [e[@"reqTruncated"] boolValue])];
+        [s appendString:@"\n"];
+    } else {
+        [s appendString:@"────────────── 请求体（无） ──────────────\n"];
     }
+    NSString *reqNote = e[@"reqNote"];
+    if (reqNote.length) [s appendFormat:@"请求备注: %@\n", reqNote];
+
+    if (rspH.count) {
+        [s appendFormat:@"────────────── 响应头 (%lu 个) ──────────────\n", (unsigned long)rspH.count];
+        [s appendString:headersText(rspH)];
+    }
+    if (rspB.length) {
+        [s appendFormat:@"────────────── 响应体 (%@) ──────────────\n", sizeStr(rspB.length)];
+        [s appendString:bodyText(rspB, [e[@"respTruncated"] boolValue])];
+        [s appendString:@"\n"];
+    } else {
+        [s appendString:@"────────────── 响应体（无） ──────────────\n"];
+    }
+    for (NSString *nt in e[@"notes"]) if (nt.length) [s appendFormat:@"备注: %@\n", nt];
+    NSString *err = e[@"error"];
+    if (err.length) [s appendFormat:@"错误: %@\n", err];
+    [s appendString:@"════════════════════════════════════════════════\n\n"];
+    return s;
 }
 
-// NSJSONSerialization 统一拦截点：登录/风控接口响应几乎都会在这里被解析一次
-// （名字保持 DidiDiagJSON，与 hookedJSONObject 里的调用点一致）
-static void DidiDiagJSON(id obj) {
+static void appendCaptureText(NSString *text) {
     @autoreleasepool {
-        if (!obj || ![NSJSONSerialization isValidJSONObject:obj]) return;
-        NSData *d = [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil];
-        if (!d || d.length > 65536) return;
-        NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-        if (!DidiDiagInterestingText(s)) return;
-        if (s.length > 8000) s = [s substringToIndex:8000];
-        DidiDiagAppend([NSString stringWithFormat:@"\n===== %@  JSON =====\n%@\n",
-                        [NSDate date], s]);
-        // 命中 58103/非官方 → 把最近请求快照一起落盘（判定签名头到底带没带）
-        DidiDiagRingIfRejected(s);
+        NSString *path = captureFilePath();
+        NSData *d = [text dataUsingEncoding:NSUTF8StringEncoding];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) {
+            [@"" writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        }
+        if (!fh) { NSLog(@"[Diditok] ✗ 抓包文件打不开: %@", path); return; }
+        [fh seekToEndOfFile];
+        [fh writeData:d];
+        [fh closeFile];
     }
 }
 
@@ -364,347 +236,611 @@ static void setButtonColor(UIColor *c) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// 密码门控
+// 抓包核心：key / 截断 / 响应提取
 // ═══════════════════════════════════════════════════════════════════════
-static void requirePassword(UIViewController *presenter, void (^onOk)(void)) {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔐 请输入密码"
-                                                                  message:@"此操作需要密码验证"
-                                                           preferredStyle:UIAlertControllerStyleAlert];
-    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.secureTextEntry = YES; tf.placeholder = @"密码";
-    }];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"确认" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        NSString *input = ac.textFields.firstObject.text ?: @"";
-        if ([input isEqualToString:DIDITOK_PASSWORD]) onOk();
-        else showToast(@"❌ 密码错误");
-    }]];
-    [presenter presentViewController:ac animated:YES completion:nil];
+static NSValue *keyFor(id task) {
+    return [NSValue valueWithPointer:(__bridge const void *)task];
+}
+static NSData *capBody(NSData *body, BOOL *trunc) {
+    if (trunc) *trunc = NO;
+    if (!body.length) return body;
+    if (body.length <= kMaxBodyBytes) return body;
+    if (trunc) *trunc = YES;
+    return [body subdataWithRange:NSMakeRange(0, kMaxBodyBytes)];
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// HAR 构建
-// ═══════════════════════════════════════════════════════════════════════
-static NSDictionary *harResponseFrom(NSURLResponse *resp, NSData *body, NSTimeInterval timingMs) {
-    NSMutableDictionary *r = [NSMutableDictionary new];
-    NSHTTPURLResponse *hr = (NSHTTPURLResponse *)resp;
-    int status = hr.statusCode ?: 0;
-    r[@"status"] = @(status);
-    r[@"statusText"] = @"";
-    r[@"httpVersion"] = @"HTTP/1.1";
-    NSMutableArray *hdrs = [NSMutableArray new];
-    [hr.allHeaderFields enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *s) {
-        [hdrs addObject:@{@"name": k, @"value": v}];
-    }];
-    r[@"headers"] = hdrs;
-    NSMutableDictionary *content = [NSMutableDictionary new];
-    if (body) {
-        NSData *trunc = body.length > 32768 ? [body subdataWithRange:NSMakeRange(0, 32768)] : body;
-        content[@"size"] = @(body.length);
-        content[@"mimeType"] = hr.MIMEType ?: @"";
-        content[@"text"] = [trunc base64EncodedStringWithOptions:0];
-        content[@"encoding"] = @"base64";
-        if (body.length > 32768) content[@"_truncated"] = @YES;
-    } else { content[@"size"] = @0; content[@"mimeType"] = @""; }
-    r[@"content"] = content;
-    r[@"redirectURL"] = @""; r[@"headersSize"] = @-1; r[@"bodySize"] = @(body ? body.length : 0);
-    r[@"time"] = @((int)(timingMs + 0.5));
-    return r;
-}
-
-static NSDictionary *buildHarEntry(NSURLRequest *req, NSURLResponse *resp,
-                                    NSTimeInterval startTime) {
-    g_harSeq++;
-    NSMutableDictionary *entry = [NSMutableDictionary new];
-    entry[@"startedDateTime"] = [@(startTime) description];
-    entry[@"_seq"] = @(g_harSeq);
-
-    NSMutableDictionary *rq = [NSMutableDictionary new];
-    rq[@"method"] = req.HTTPMethod ?: @"GET";
-    rq[@"url"]    = req.URL.absoluteString ?: @"";
-    rq[@"httpVersion"] = @"HTTP/1.1";
-    NSMutableArray *hdrs = [NSMutableArray new];
-    [req.allHTTPHeaderFields enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *s) {
-        [hdrs addObject:@{@"name": k, @"value": v}];
-    }];
-    rq[@"headers"] = hdrs;
-    NSURLComponents *uc = [NSURLComponents componentsWithURL:req.URL resolvingAgainstBaseURL:NO];
-    NSMutableArray *qs = [NSMutableArray new];
-    for (NSURLQueryItem *qi in uc.queryItems) {
-        [qs addObject:@{@"name": qi.name ?: @"", @"value": qi.value ?: @""}];
+static void setRespFromResponse(NSMutableDictionary *e, NSURLResponse *resp) {
+    if (!resp) return;
+    if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
+        NSHTTPURLResponse *hr = (NSHTTPURLResponse *)resp;
+        e[@"statusCode"]  = @(hr.statusCode);
+        e[@"respHeaders"] = hr.allHeaderFields ?: @{};
     }
-    rq[@"queryString"] = qs;
-    NSMutableDictionary *pd = [NSMutableDictionary new];
-    if (req.HTTPBody && req.HTTPBody.length) {
-        NSData *trunc = req.HTTPBody.length > 16384 ?
-            [req.HTTPBody subdataWithRange:NSMakeRange(0, 16384)] : req.HTTPBody;
-        pd[@"mimeType"] = req.allHTTPHeaderFields[@"Content-Type"] ?:
-                         req.allHTTPHeaderFields[@"content-type"] ?: @"application/octet-stream";
-        pd[@"text"] = [[NSString alloc] initWithData:trunc encoding:NSUTF8StringEncoding]
-                      ?: [trunc base64EncodedStringWithOptions:0];
-        pd[@"encoding"] = @"utf-8"; pd[@"size"] = @(req.HTTPBody.length);
-        if (req.HTTPBody.length > 16384) pd[@"_truncated"] = @YES;
-    } else { pd[@"mimeType"] = @""; pd[@"text"] = @""; pd[@"size"] = @0; }
-    rq[@"postData"] = pd;
-    rq[@"cookies"] = @[]; rq[@"headersSize"] = @-1; rq[@"bodySize"] = @(req.HTTPBody ? req.HTTPBody.length : 0);
-    entry[@"request"] = rq;
-
-    entry[@"response"] = resp ? harResponseFrom(resp, nil, 0) :
-        @{@"status":@0, @"statusText":@"Pending", @"httpVersion":@"",
-          @"headers":@[], @"content":@{@"size":@0}, @"redirectURL":@"",
-          @"headersSize":@0, @"bodySize":@0, @"_pending":@YES};
-    entry[@"cache"] = @{};
-    entry[@"timings"] = @{@"send":@0, @"wait":@0, @"receive":@0, @"dns":@-1,
-                          @"connect":@-1, @"ssl":@-1, @"blocked":@-1};
-    return entry;
+    e[@"respMime"] = resp.MIMEType ?: @"";
+    if (resp.suggestedFilename.length) e[@"respFile"] = resp.suggestedFilename;
 }
 
-// 导出 HAR → 写盘 → 弹系统分享面板 → 清空缓冲（避免误触重复导出）
-static UIViewController *topVC(void);   // 定义在后面，这里先声明
-static void exportHarAndShare(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [g_harLock lock]; NSArray *snap = [g_harEntries copy]; [g_harLock unlock];
-        if (snap.count == 0) { showToast(@"⚠️ 还没有抓到请求"); return; }
+// ═══════════════════════════════════════════════════════════════════════
+// KVO 兜底：观察 task 的 response / state
+//   · response → 补响应头/状态码（无 completionHandler 的任务靠这个）
+//   · state    → Completed/Canceling 时收尾（代理回调路径优先，这里兜底）
+// ═══════════════════════════════════════════════════════════════════════
+@interface DiditokKvo : NSObject
++ (instancetype)shared;
+@end
+@implementation DiditokKvo
++ (instancetype)shared {
+    static DiditokKvo *inst; static dispatch_once_t t;
+    dispatch_once(&t, ^{ inst = [DiditokKvo new]; });
+    return inst;
+}
+- (void)observeValueForKeyPath:(NSString *)kp ofObject:(id)obj
+                        change:(NSDictionary *)change context:(void *)ctx {
+    if (![obj isKindOfClass:[NSURLSessionTask class]]) return;
+    NSURLSessionTask *task = obj;
+    NSValue *k = keyFor(task);
 
-        NSDictionary *har = @{@"log": @{
-            @"version": @"1.2",
-            @"creator": @{@"name": @"Diditok", @"version": @"0.4"},
-            @"entries": snap,
-            @"_proxyman": @{@"appName": @"滴滴", @"platform": @"iOS", @"tweak": @"Diditok"}}};
-        NSError *err;
-        NSData *data = [NSJSONSerialization dataWithJSONObject:har options:NSJSONWritingPrettyPrinted error:&err];
-        if (!data) { showToast([NSString stringWithFormat:@"❌ HAR 失败: %@", err]); return; }
+    if ([kp isEqualToString:@"response"]) {
+        if (!task.response) return;
+        [g_mapLock lock];
+        NSMutableDictionary *e = g_pendingMap[k];
+        if (e && ![e[@"finalized"] boolValue]) setRespFromResponse(e, task.response);
+        [g_mapLock unlock];
+        return;
+    }
 
-        NSString *path = [documentsDir() stringByAppendingPathComponent:@"diditok_full.har"];
-        [data writeToFile:path atomically:YES];
-        NSLog(@"[Diditok] HAR %d → %@", (int)snap.count, path);
+    if (![kp isEqualToString:@"state"]) return;
+    if (task.state != NSURLSessionTaskStateCompleted &&
+        task.state != NSURLSessionTaskStateCanceling) return;
 
-        // 导出即清空缓冲
-        [g_harLock lock]; g_harEntries = [NSMutableArray new]; g_harSeq = 0; [g_harLock unlock];
+    // 收尾：先摘观察器，再合并累积的响应体
+    @try { [task removeObserver:self forKeyPath:@"response"]; } @catch (NSException *ex) {}
+    @try { [task removeObserver:self forKeyPath:@"state"]; }    @catch (NSException *ex) {}
 
-        showToast([NSString stringWithFormat:@"📤 已导出 %d 条，选「存储到文件」可存到 iCloud/本地", (int)snap.count]);
+    [g_mapLock lock];
+    NSMutableDictionary *e    = g_pendingMap[k];
+    NSMutableData      *acc   = g_bodyMap[k];
+    [g_bodyMap removeObjectForKey:k];
+    BOOL staleCH = NO;
+    if (e) {
+        if ([e[@"finalized"] boolValue]) {
+            e = nil;
+        } else if ([e[@"willSelfFinalize"] boolValue] &&
+                   task.state == NSURLSessionTaskStateCompleted) {
+            // completionHandler 路径：handler 大概率马上回调，兜底延迟收尾，
+            // 避免抢在 handler 之前收尾导致响应体丢失
+            staleCH = YES;
+        } else {
+            [g_pendingMap removeObjectForKey:k];
+        }
+    }
+    [g_mapLock unlock];
 
-        // 等子菜单收起后再弹分享面板
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300000000)),
-                       dispatch_get_main_queue(), ^{
-            UIViewController *p = topVC();
-            if (!p) { showToast(@"❌ 找不到可用窗口"); return; }
-            UIActivityViewController *av =
-                [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
-                                                  applicationActivities:nil];
-            if (av.popoverPresentationController) {
-                av.popoverPresentationController.sourceView = g_floatButton ?: p.view;
-                av.popoverPresentationController.sourceRect = g_floatButton ? g_floatButton.bounds : p.view.bounds;
+    if (e) {
+        setRespFromResponse(e, task.response);
+        NSMutableArray *extras = [NSMutableArray new];
+        if (task.state == NSURLSessionTaskStateCanceling) [extras addObject:@"任务被取消"];
+        if (!acc.length) [extras addObject:@"响应体未捕获（无 completionHandler 且无代理回调）"];
+        finalizeEntry(e, acc, nil, extras.count ? [extras componentsJoinedByString:@"；"] : nil);
+    }
+    if (staleCH) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            [g_mapLock lock];
+            NSMutableDictionary *still = g_pendingMap[k];
+            [g_pendingMap removeObjectForKey:k];
+            [g_mapLock unlock];
+            if (still) {
+                setRespFromResponse(still, task.response);
+                finalizeEntry(still, nil, nil, @"completionHandler 未回调，KVO 兜底收尾");
             }
-            [p presentViewController:av animated:YES completion:nil];
         });
-    });
+    }
 }
+@end
 
-// 保存密文 → 写盘 → 直接弹系统分享面板（可以「存储到文件」/微信/AirDrop）
-static void saveCipherAndShare(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        NSString *ct = buildCipherText();
-        NSString *path = [documentsDir() stringByAppendingPathComponent:@"diditok.txt"];
-        [ct writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        NSLog(@"[Diditok] 密文写入 %@", path);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300000000)),
-                       dispatch_get_main_queue(), ^{
-            UIViewController *p = topVC();
-            if (!p) { showToast(@"❌ 找不到可用窗口"); return; }
-            UIActivityViewController *av =
-                [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
-                                                  applicationActivities:nil];
-            if (av.popoverPresentationController) {
-                av.popoverPresentationController.sourceView = g_floatButton ?: p.view;
-                av.popoverPresentationController.sourceRect = g_floatButton ? g_floatButton.bounds : p.view.bounds;
-            }
-            [p presentViewController:av animated:YES completion:nil];
-        });
-    });
-}
-
-static void captureRequest(NSURLRequest *req, NSURLSessionTask *task) {
-    if (!g_captureEnabled) return;
+// 请求创建时登记 entry；未开启抓包返回 nil
+static NSMutableDictionary *maybeCapture(NSURLRequest *req, NSURLSessionTask *task,
+                                         NSData *uploadBody, NSString *note, BOOL willSelfFinalize) {
+    if (!g_captureEnabled) return nil;
     @autoreleasepool {
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970] * 1000.0;
-        NSDictionary *entry = buildHarEntry(req, nil, now);
-        [g_harLock lock]; [g_harEntries addObject:entry]; [g_harLock unlock];
-        NSValue *k = [NSValue valueWithPointer:(__bridge const void *)task];
-        if (!g_pendingHarMap) g_pendingHarMap = [NSMutableDictionary new];
-        g_pendingHarMap[k] = entry;
-        @try { [task addObserver:[DiditokKvo shared] forKeyPath:@"response"
-                          options:NSKeyValueObservingOptionNew context:(__bridge void *)k]; }
-        @catch (NSException *e) {}
-        @try { [task addObserver:[DiditokKvo shared] forKeyPath:@"state"
-                          options:NSKeyValueObservingOptionNew context:(__bridge void *)k]; }
-        @catch (NSException *e) {}
-    }
-}
-
-static NSString* matchHeader(NSRegularExpression *re, NSString *s) {
-    NSTextCheckingResult *m = [re firstMatchInString:s options:0 range:NSMakeRange(0, s.length)];
-    if (m && m.numberOfRanges > 1) return [s substringWithRange:[m rangeAtIndex:1]];
-    return nil;
-}
-
-// header 名大小写不敏感取值（allHTTPHeaderFields 的键大小写不保证）
-static NSString *headerValue(NSDictionary *hdrs, NSString *name) {
-    NSString *v = hdrs[name];
-    if (v.length) return v;
-    for (NSString *k in hdrs) {
-        if ([k caseInsensitiveCompare:name] == NSOrderedSame) return hdrs[k];
-    }
-    return nil;
-}
-
-// 从 URL query 取字段（ddfp / device_id / token / tkn 都在这里）
-static NSString *urlQueryValue(NSURLRequest *req, NSString *name) {
-    NSString *q = req.URL.query;
-    if (!q.length) return nil;
-    for (NSString *pair in [q componentsSeparatedByString:@"&"]) {
-        NSRange eq = [pair rangeOfString:@"="];
-        if (eq.location == NSNotFound) continue;
-        if (![[pair substringToIndex:eq.location] isEqualToString:name]) continue;
-        NSString *v = [pair substringFromIndex:eq.location + 1];
-        return [v stringByRemovingPercentEncoding] ?: v;
-    }
-    return nil;
-}
-
-// 递归在 JSON 里按 key 找字符串值
-static id DidiJSONFind(id obj, NSArray *keys, int depth) {
-    if (depth > 8 || !obj) return nil;
-    if ([obj isKindOfClass:[NSDictionary class]]) {
-        for (NSString *k in keys) {
-            id v = ((NSDictionary *)obj)[k];
-            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) return v;
+        [g_stateLock lock]; int seq = ++g_seq; [g_stateLock unlock];
+        NSMutableDictionary *e = [NSMutableDictionary new];
+        e[@"seq"]         = @(seq);
+        e[@"start"]       = [NSDate date];
+        e[@"method"]      = req.HTTPMethod ?: @"GET";
+        e[@"url"]         = req.URL.absoluteString ?: @"";
+        e[@"httpVersion"] = req.HTTPVersion ?: @"";
+        e[@"timeout"]     = @(req.timeoutInterval);
+        e[@"reqHeaders"]  = req.allHTTPHeaderFields ?: @{};
+        NSData *raw = uploadBody ?: req.HTTPBody;
+        BOOL tr = NO;
+        e[@"reqBody"]      = capBody(raw, &tr);
+        e[@"reqTruncated"] = @(tr);
+        e[@"reqMime"]      = headerValue(req.allHTTPHeaderFields, @"Content-Type") ?: @"";
+        if (!raw && req.HTTPBodyStream) {
+            e[@"reqNote"] = @"请求体为 HTTPBodyStream 流式上传，未读取（读流会破坏原请求）";
+        } else if (note.length) {
+            e[@"reqNote"] = note;
         }
-        for (id v in [(NSDictionary *)obj allValues]) {
-            id r = DidiJSONFind(v, keys, depth + 1);
-            if (r) return r;
+        e[@"finalized"]        = @NO;
+        e[@"willSelfFinalize"] = @(willSelfFinalize);
+        e[@"notes"]            = [NSMutableArray new];
+
+        if (task) {
+            NSValue *k = keyFor(task);
+            [g_mapLock lock]; g_pendingMap[k] = e; [g_mapLock unlock];
+            @try { [task addObserver:[DiditokKvo shared] forKeyPath:@"response"
+                                     options:NSKeyValueObservingOptionNew context:NULL]; }
+            @catch (NSException *ex) {}
+            @try { [task addObserver:[DiditokKvo shared] forKeyPath:@"state"
+                                     options:NSKeyValueObservingOptionNew context:NULL]; }
+            @catch (NSException *ex) {}
         }
-    } else if ([obj isKindOfClass:[NSArray class]]) {
-        for (id v in (NSArray *)obj) {
-            id r = DidiJSONFind(v, keys, depth + 1);
-            if (r) return r;
-        }
+        return e;
     }
-    return nil;
 }
 
-static id bodyJSONValue(NSData *body, NSArray *keys) {
-    if (!body.length || body.length > 512 * 1024) return nil;
-    id obj = [NSJSONSerialization JSONObjectWithData:body options:0 error:nil];
-    if (!obj) return nil;
-    return DidiJSONFind(obj, keys, 0);
+// 请求完成：算耗时 → 串行队列追加写盘
+static void finalizeEntry(NSMutableDictionary *e, NSData *respBody, NSError *err, NSString *extra) {
+    if (!e) return;
+    @autoreleasepool {
+        BOOL proceed = NO;
+        [g_mapLock lock];
+        if (![e[@"finalized"] boolValue]) { e[@"finalized"] = @YES; proceed = YES; }
+        [g_mapLock unlock];
+        if (!proceed) return;
+
+        NSDate *start = e[@"start"];
+        double ms = start ? [[NSDate date] timeIntervalSinceDate:start] * 1000.0 : 0;
+        e[@"ms"]  = @(ms);
+        e[@"end"] = [NSDate date];
+        BOOL tr = NO;
+        e[@"respBody"]      = capBody(respBody, &tr);
+        e[@"respTruncated"] = @(tr);
+        e[@"error"]         = err.localizedDescription ?: @"";
+        if (extra.length) [(NSMutableArray *)e[@"notes"] addObject:extra];
+
+        NSString *text = renderEntry(e);
+        [g_stateLock lock]; g_count++; [g_stateLock unlock];
+        dispatch_async(g_writeQueue, ^{ appendCaptureText(text); });
+    }
 }
 
-// 只从响应体里补「手机号」，且仅在尚未拿到时执行（避免每次请求都解析）
-static void onCredsFound(void);   // 定义在后面，这里先声明
-
-// 从一个「键名看起来像手机号」的字符串值里抽出 11 位号码
-static NSString *DidiExtractPhone(NSString *s) {
-    if (![s isKindOfClass:[NSString class]] || s.length > 24) return nil;
-    static NSRegularExpression *re; static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        re = [NSRegularExpression regularExpressionWithPattern:@"1[3-9]\\d{9}" options:0 error:nil];
-    });
-    NSString *t = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-    NSTextCheckingResult *m = [re firstMatchInString:t options:0 range:NSMakeRange(0, t.length)];
-    if (!m) return nil;
-    return [t substringWithRange:m.range];
+static void noteEntry(NSURLSessionTask *task, NSString *note) {
+    if (!task || !note.length) return;
+    NSValue *k = keyFor(task);
+    [g_mapLock lock];
+    NSMutableDictionary *e = g_pendingMap[k];
+    if (e && ![e[@"finalized"] boolValue]) [(NSMutableArray *)e[@"notes"] addObject:note];
+    [g_mapLock unlock];
 }
 
-// 递归扫 JSON：只认「键名含 phone/mobile/cell/tel」的值，避免把订单号/会话号误判成手机号
-static NSString *DidiFindPhoneInJSON(id obj, int depth, int *budget) {
-    if (!obj || depth > 8 || *budget <= 0) return nil;
-    (*budget)--;
-    if ([obj isKindOfClass:[NSDictionary class]]) {
-        for (NSString *k in (NSDictionary *)obj) {
-            if (*budget <= 0) return nil;
-            id v = ((NSDictionary *)obj)[k];
-            if ([k isKindOfClass:[NSString class]]) {
-                NSString *lk = [k lowercaseString];
-                if ([lk containsString:@"phone"] || [lk containsString:@"mobile"]
-                    || [lk containsString:@"cell"]  || [lk containsString:@"tel"]) {
-                    NSString *hit = DidiExtractPhone(v);
-                    if (hit.length) return hit;
+// ═══════════════════════════════════════════════════════════════════════
+// session 代理包装（NSProxy）：
+//   拦截 4 个 delegate 回调做抓包，其余全部转发给原 delegate。
+//   好处：不用扫描/hook 任何业务类，对 App 完全透明。
+// ═══════════════════════════════════════════════════════════════════════
+static NSString *const kSelData     = @"URLSession:dataTask:didReceiveData:";
+static NSString *const kSelComplete = @"URLSession:task:didCompleteWithError:";
+static NSString *const kSelDownFile = @"URLSession:downloadTask:didFinishDownloadingToURL:";
+static NSString *const kSelRedirect = @"URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:";
+
+@interface DiditokSessionProxy : NSProxy
+- (instancetype)initWithTarget:(id)target;
+@end
+
+@implementation DiditokSessionProxy {
+    __strong id _target;
+}
+- (instancetype)initWithTarget:(id)target {
+    _target = target;
+    return self;
+}
+- (BOOL)respondsToSelector:(SEL)s {
+    if (s == NSSelectorFromString(kSelData) ||
+        s == NSSelectorFromString(kSelComplete) ||
+        s == NSSelectorFromString(kSelDownFile) ||
+        s == NSSelectorFromString(kSelRedirect)) return YES;
+    return [_target respondsToSelector:s];
+}
+- (BOOL)conformsToProtocol:(Protocol *)p { return [_target conformsToProtocol:p]; }
+- (BOOL)isKindOfClass:(Class)cls {
+    if ([super isKindOfClass:cls]) return YES;
+    return [_target isKindOfClass:cls];
+}
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)s {
+    NSMethodSignature *sig = [_target methodSignatureForSelector:s];
+    if (!sig) sig = [NSMethodSignature signatureWithObjCTypes:"v@:@"];
+    return sig;
+}
+- (void)forwardInvocation:(NSInvocation *)inv {
+    if ([_target respondsToSelector:inv.selector]) [inv invokeWithTarget:_target];
+}
+// —— 数据块：累积到该 task 的 entry ——
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)task
+        didReceiveData:(NSData *)data {
+    @try {
+        if ([task isKindOfClass:[NSURLSessionTask class]] && [data isKindOfClass:[NSData class]]) {
+            NSValue *k = keyFor(task);
+            [g_mapLock lock];
+            NSMutableDictionary *e = g_pendingMap[k];
+            if (e && ![e[@"finalized"] boolValue]) {
+                NSMutableData *acc = g_bodyMap[k];
+                if (!acc) { acc = [NSMutableData data]; g_bodyMap[k] = acc; }
+                if (acc.length < kMaxBodyBytes) {
+                    NSUInteger room = kMaxBodyBytes - acc.length;
+                    [acc appendData:(data.length > room ?
+                        [data subdataWithRange:NSMakeRange(0, room)] : data)];
                 }
             }
-            NSString *r = DidiFindPhoneInJSON(v, depth + 1, budget);
-            if (r.length) return r;
+            [g_mapLock unlock];
         }
-    } else if ([obj isKindOfClass:[NSArray class]]) {
-        for (id v in (NSArray *)obj) {
-            NSString *r = DidiFindPhoneInJSON(v, depth + 1, budget);
-            if (r.length) return r;
+    } @catch (NSException *ex) { NSLog(@"[Diditok] ✗ didReceiveData: %@", ex); }
+    if ([_target respondsToSelector:@selector(URLSession:dataTask:didReceiveData:)]) {
+        void (*fp)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *) =
+            (void (*)(id, SEL, NSURLSession *, NSURLSessionDataTask *, NSData *))[_target methodForSelector:_cmd];
+        fp(_target, _cmd, session, task, data);
+    }
+}
+// —— 完成：合并累积响应体并收尾 ——
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+        didCompleteWithError:(NSError *)error {
+    @try {
+        if ([task isKindOfClass:[NSURLSessionTask class]]) {
+            NSValue *k = keyFor(task);
+            [g_mapLock lock];
+            NSMutableDictionary *e  = g_pendingMap[k];
+            NSMutableData      *acc = g_bodyMap[k];
+            [g_bodyMap removeObjectForKey:k];
+            BOOL mine = e && ![e[@"finalized"] boolValue] && ![e[@"willSelfFinalize"] boolValue];
+            if (mine) [g_pendingMap removeObjectForKey:k];
+            [g_mapLock unlock];
+            if (mine) {
+                setRespFromResponse(e, task.response);
+                finalizeEntry(e, acc, error, nil);
+            }
         }
+    } @catch (NSException *ex) { NSLog(@"[Diditok] ✗ didComplete: %@", ex); }
+    if ([_target respondsToSelector:@selector(URLSession:task:didCompleteWithError:)]) {
+        void (*fp)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *) =
+            (void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSError *))[_target methodForSelector:_cmd];
+        fp(_target, _cmd, session, task, error);
     }
-    return nil;
+}
+// —— 下载落盘 ——
+- (void)URLSession:(NSURLSession *)session downloadTask:(NSURLSessionDownloadTask *)task
+        didFinishDownloadingToURL:(NSURL *)location {
+    @try { noteEntry(task, [NSString stringWithFormat:@"下载落盘: %@", location.path ?: @""]); }
+    @catch (NSException *ex) {}
+    if ([_target respondsToSelector:@selector(URLSession:downloadTask:didFinishDownloadingToURL:)]) {
+        void (*fp)(id, SEL, NSURLSession *, NSURLSessionDownloadTask *, NSURL *) =
+            (void (*)(id, SEL, NSURLSession *, NSURLSessionDownloadTask *, NSURL *))[_target methodForSelector:_cmd];
+        fp(_target, _cmd, session, task, location);
+    }
+}
+// —— 重定向：记一条备注，跟随原语义 ——
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task
+        willPerformHTTPRedirection:(NSHTTPURLResponse *)response
+        newRequest:(NSURLRequest *)request
+        completionHandler:(void (^)(NSURLRequest *))completionHandler {
+    @try {
+        noteEntry(task, [NSString stringWithFormat:@"↪️ 重定向 %ld → %@",
+            (long)response.statusCode, request.URL.absoluteString ?: @""]);
+    } @catch (NSException *ex) {}
+    SEL s = @selector(URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:);
+    if ([_target respondsToSelector:s]) {
+        void (*fp)(id, SEL, NSURLSession *, NSURLSessionTask *, NSHTTPURLResponse *,
+                   NSURLRequest *, void (^)(NSURLRequest *)) =
+            (void (*)(id, SEL, NSURLSession *, NSURLSessionTask *, NSHTTPURLResponse *,
+                      NSURLRequest *, void (^)(NSURLRequest *)))[_target methodForSelector:s];
+        fp(_target, s, session, task, response, request, completionHandler);
+    } else if (completionHandler) {
+        completionHandler(request);   // 目标没实现 → 走默认：跟随重定向
+    }
+}
+@end
+
+// ═══════════════════════════════════════════════════════════════════════
+// hook 安装工具
+// ═══════════════════════════════════════════════════════════════════════
+static void hookInstanceMethod(Class c, const char *selName, IMP newImp, IMP *slot, const char *label) {
+    SEL s = NSSelectorFromString(@(selName));
+    @try {
+        if (DidiHook(c, s, newImp, slot)) NSLog(@"[Diditok] ✓ hooked %@", @(label));
+        else NSLog(@"[Diditok] ⚠️ 未找到 %@", @(label));
+    } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook %@ 失败: %@", @(label), e); }
+}
+static void hookClassMethod(Class c, const char *selName, IMP newImp, IMP *slot, const char *label) {
+    SEL s = NSSelectorFromString(@(selName));
+    @try {
+        Method m = class_getClassMethod(c, s);
+        if (!m) { NSLog(@"[Diditok] ⚠️ 未找到类方法 %@", @(label)); return; }
+        if (slot) *slot = method_getImplementation(m);
+        method_setImplementation(m, newImp);
+        NSLog(@"[Diditok] ✓ hooked %@", @(label));
+    } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook %@ 失败: %@", @(label), e); }
 }
 
-static void scanResponseBodyForPhone(NSData *data) {
-    if (g_lastPhone.length || !data.length || data.length > 512 * 1024) return;
+// 下载落盘文件预览（最多 1 MB，完整文件在备注里的路径）
+static NSData *previewFile(NSURL *loc) {
     @autoreleasepool {
-        id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-        int budget = 400;
-        NSString *p = DidiFindPhoneInJSON(obj, 0, &budget);
-        if (p.length) { g_lastPhone = p; onCredsFound(); }
+        NSString *p = loc.path;
+        if (!p.length) return nil;
+        NSDictionary *at = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+        unsigned long long sz = at ? [at fileSize] : 0;
+        if (!sz) return nil;
+        NSUInteger n = (NSUInteger)MIN((unsigned long long)(1024 * 1024), sz);
+        NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:p];
+        NSData *d = [fh readDataOfLength:n];
+        [fh closeFile];
+        return d;
     }
 }
 
-static void onCredsFound(void) {
-    setButtonColor([UIColor colorWithRed:0.1 green:0.7 blue:0.2 alpha:0.9]);
-    writeCipherOnly();
-    showToast([NSString stringWithFormat:@"✓ 新凭据  ddfp=%@",
-               g_lastDdfp.length ? [g_lastDdfp substringToIndex:MIN(g_lastDdfp.length, 12)] : @"—"]);
-}
+// ═══════════════════════════════════════════════════════════════════════
+// NSURLSession 任务创建 hook（10 个入口全覆盖）
+//   completionHandler 路径 → 包一层 handler 拿响应体，自己收尾
+//   无 handler 路径        → 交给 session 代理回调 / KVO 兜底
+// ═══════════════════════════════════════════════════════════════════════
 
-static void scanHeaders(NSURLRequest *req, NSString *src, NSURLSessionTask *task) {
-    @autoreleasepool {
-        // ── 实测（HAR 207 条 + 主二进制扫描）：
-        //   auToken : 请求头 secdd-authentication（94 条请求，值稳定，120 字符 hex）
-        //   token   : 196 字符，出现在 query "token=" / body "token" / 请求头 "token" / query "tkn="
-        //   ddfp    : 64 hex，出现在 query "ddfp="（68 次），device_id= 同值
-        //   ❌ 旧代码用的 didi-header-ssuuid / didi-header-deviceid 在 App 与流量里都是 0 次
-        NSDictionary *hdrs = req.allHTTPHeaderFields;
-
-        NSString *au = headerValue(hdrs, @"secdd-authentication")
-                    ?: (hdrs.count ? matchHeader(g_reAu, hdrs.description) : nil);
-
-        NSString *ddfp = urlQueryValue(req, @"ddfp")
-                      ?: urlQueryValue(req, @"device_id")
-                      ?: headerValue(hdrs, @"ddfp")
-                      ?: bodyJSONValue(req.HTTPBody, @[@"ddfp", @"device_id"]);
-
-        NSString *tok = headerValue(hdrs, @"token")
-                     ?: urlQueryValue(req, @"token")
-                     ?: urlQueryValue(req, @"tkn")
-                     ?: bodyJSONValue(req.HTTPBody, @[@"token"]);
-
-        NSString *dev = urlQueryValue(req, @"device_id");
-
-        // 空串/占位值不写入（token 未登录时可能是 ""，别把已拿到的覆盖掉）
-        if (au.length   < 16) au   = nil;
-        if (ddfp.length < 8)  ddfp = nil;
-        if (tok.length  < 8)  tok  = nil;
-        if (dev.length  < 8)  dev  = nil;
-
-        BOOL changed = NO;
-        if (au   && ![au   isEqualToString:g_lastAuToken])  { g_lastAuToken  = au;   changed = YES; }
-        if (ddfp && ![ddfp isEqualToString:g_lastDdfp])     { g_lastDdfp     = ddfp; changed = YES; }
-        if (dev  && ![dev  isEqualToString:g_lastDeviceId]) { g_lastDeviceId = dev;  changed = YES; }
-        if (tok  && ![tok  isEqualToString:g_lastToken])    { g_lastToken    = tok;  changed = YES; }
-
-        if (changed && (g_lastAuToken || g_lastDdfp || g_lastToken)) onCredsFound();
-        if (g_captureEnabled) captureRequest(req, task);
+// 1. dataTaskWithRequest:completionHandler:
+static id hookedDataTaskCH(id self, SEL _cmd, NSURLRequest *req, id handler) {
+    typedef id (*o_t)(id, SEL, NSURLRequest *, id);
+    __block NSMutableDictionary *entry = nil;
+    id wrapped = handler;
+    if (handler) {
+        void (^orig)(NSData *, NSURLResponse *, NSError *) =
+            (void (^)(NSData *, NSURLResponse *, NSError *))handler;
+        wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
+            @try {
+                if (entry) {
+                    setRespFromResponse(entry, resp);
+                    finalizeEntry(entry, data, err, nil);
+                }
+            } @catch (NSException *ex) { NSLog(@"[Diditok] ✗ CH: %@", ex); }
+            orig(data, resp, err);
+        };
     }
+    id task = g_origDataTaskCH
+        ? ((o_t)g_origDataTaskCH)(self, _cmd, req, wrapped)
+        : ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, req, wrapped);
+    if (task) entry = maybeCapture(req, task, nil, nil, YES);
+    return task;
 }
 
+// 2. dataTaskWithRequest:（无 handler → 代理/KVO 路径）
+static id hookedDataTaskNH(id self, SEL _cmd, NSURLRequest *req) {
+    typedef id (*o_t)(id, SEL, NSURLRequest *);
+    id task = g_origDataTaskNH
+        ? ((o_t)g_origDataTaskNH)(self, _cmd, req)
+        : ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, req);
+    if (task) maybeCapture(req, task, nil, nil, NO);
+    return task;
+}
 
-static UIWindow *appWindow(void);
-static UIViewController *topVC(void);
+// 3. dataTaskWithURL:completionHandler:
+static id hookedDataTaskURLCH(id self, SEL _cmd, NSURL *url, id handler) {
+    typedef id (*o_t)(id, SEL, NSURL *, id);
+    __block NSMutableDictionary *entry = nil;
+    id wrapped = handler;
+    if (handler) {
+        void (^orig)(NSData *, NSURLResponse *, NSError *) =
+            (void (^)(NSData *, NSURLResponse *, NSError *))handler;
+        wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
+            @try {
+                if (entry) {
+                    setRespFromResponse(entry, resp);
+                    finalizeEntry(entry, data, err, nil);
+                }
+            } @catch (NSException *ex) { NSLog(@"[Diditok] ✗ URLCH: %@", ex); }
+            orig(data, resp, err);
+        };
+    }
+    id task = g_origDataTaskURLCH
+        ? ((o_t)g_origDataTaskURLCH)(self, _cmd, url, wrapped)
+        : ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, url, wrapped);
+    if (task) {
+        NSURLRequest *req = [NSURLRequest requestWithURL:url];
+        entry = maybeCapture(req, task, nil, nil, YES);
+    }
+    return task;
+}
+
+// 4. dataTaskWithURL:
+static id hookedDataTaskURLNH(id self, SEL _cmd, NSURL *url) {
+    typedef id (*o_t)(id, SEL, NSURL *);
+    id task = g_origDataTaskURLNH
+        ? ((o_t)g_origDataTaskURLNH)(self, _cmd, url)
+        : ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, url);
+    if (task) {
+        NSURLRequest *req = [NSURLRequest requestWithURL:url];
+        maybeCapture(req, task, nil, nil, NO);
+    }
+    return task;
+}
+
+// 5. uploadTaskWithRequest:fromData:completionHandler:
+static id hookedUploadCH(id self, SEL _cmd, NSURLRequest *req, NSData *upData, id handler) {
+    typedef id (*o_t)(id, SEL, NSURLRequest *, NSData *, id);
+    __block NSMutableDictionary *entry = nil;
+    id wrapped = handler;
+    if (handler) {
+        void (^orig)(NSData *, NSURLResponse *, NSError *) =
+            (void (^)(NSData *, NSURLResponse *, NSError *))handler;
+        wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
+            @try {
+                if (entry) {
+                    setRespFromResponse(entry, resp);
+                    finalizeEntry(entry, data, err, nil);
+                }
+            } @catch (NSException *ex) { NSLog(@"[Diditok] ✗ UPCH: %@", ex); }
+            orig(data, resp, err);
+        };
+    }
+    id task = g_origUploadDataCH
+        ? ((o_t)g_origUploadDataCH)(self, _cmd, req, upData, wrapped)
+        : ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, req, upData, wrapped);
+    if (task) entry = maybeCapture(req, task, upData, @"上传任务（请求体=fromData）", YES);
+    return task;
+}
+
+// 6. uploadTaskWithRequest:fromData:
+static id hookedUploadNH(id self, SEL _cmd, NSURLRequest *req, NSData *upData) {
+    typedef id (*o_t)(id, SEL, NSURLRequest *, NSData *);
+    id task = g_origUploadDataNH
+        ? ((o_t)g_origUploadDataNH)(self, _cmd, req, upData)
+        : ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, req, upData);
+    if (task) maybeCapture(req, task, upData, @"上传任务（请求体=fromData）", NO);
+    return task;
+}
+
+// 7. uploadTaskWithStreamedRequest:
+static id hookedUploadStream(id self, SEL _cmd, NSURLRequest *req) {
+    typedef id (*o_t)(id, SEL, NSURLRequest *);
+    id task = g_origUploadStream
+        ? ((o_t)g_origUploadStream)(self, _cmd, req)
+        : ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, req);
+    if (task) maybeCapture(req, task, nil, @"流式上传（请求体在流里，未读取）", NO);
+    return task;
+}
+
+// 8. downloadTaskWithRequest:completionHandler:
+static id hookedDownloadCH(id self, SEL _cmd, NSURLRequest *req, id handler) {
+    typedef id (*o_t)(id, SEL, NSURLRequest *, id);
+    __block NSMutableDictionary *entry = nil;
+    id wrapped = handler;
+    if (handler) {
+        void (^orig)(NSURL *, NSURLResponse *, NSError *) =
+            (void (^)(NSURL *, NSURLResponse *, NSError *))handler;
+        wrapped = ^(NSURL *loc, NSURLResponse *resp, NSError *err) {
+            @try {
+                if (entry) {
+                    setRespFromResponse(entry, resp);
+                    NSString *extra = nil;
+                    NSData *body = nil;
+                    if (loc) {
+                        extra = [NSString stringWithFormat:@"下载落盘: %@", loc.path ?: @""];
+                        body = previewFile(loc);
+                    }
+                    finalizeEntry(entry, body, err, extra);
+                }
+            } @catch (NSException *ex) { NSLog(@"[Diditok] ✗ DLCH: %@", ex); }
+            orig(loc, resp, err);
+        };
+    }
+    id task = g_origDownloadCH
+        ? ((o_t)g_origDownloadCH)(self, _cmd, req, wrapped)
+        : ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, req, wrapped);
+    if (task) entry = maybeCapture(req, task, nil, @"下载任务（响应体=落盘文件预览）", YES);
+    return task;
+}
+
+// 9. downloadTaskWithURL:completionHandler:
+static id hookedDownloadURLCH(id self, SEL _cmd, NSURL *url, id handler) {
+    typedef id (*o_t)(id, SEL, NSURL *, id);
+    __block NSMutableDictionary *entry = nil;
+    id wrapped = handler;
+    if (handler) {
+        void (^orig)(NSURL *, NSURLResponse *, NSError *) =
+            (void (^)(NSURL *, NSURLResponse *, NSError *))handler;
+        wrapped = ^(NSURL *loc, NSURLResponse *resp, NSError *err) {
+            @try {
+                if (entry) {
+                    setRespFromResponse(entry, resp);
+                    NSString *extra = nil;
+                    NSData *body = nil;
+                    if (loc) {
+                        extra = [NSString stringWithFormat:@"下载落盘: %@", loc.path ?: @""];
+                        body = previewFile(loc);
+                    }
+                    finalizeEntry(entry, body, err, extra);
+                }
+            } @catch (NSException *ex) { NSLog(@"[Diditok] ✗ DLURLCH: %@", ex); }
+            orig(loc, resp, err);
+        };
+    }
+    id task = g_origDownloadURLCH
+        ? ((o_t)g_origDownloadURLCH)(self, _cmd, url, wrapped)
+        : ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, url, wrapped);
+    if (task) {
+        NSURLRequest *req = [NSURLRequest requestWithURL:url];
+        entry = maybeCapture(req, task, nil, @"下载任务（响应体=落盘文件预览）", YES);
+    }
+    return task;
+}
+
+// 10. downloadTaskWithRequest:（无 handler → didFinishDownloadingToURL 记路径）
+static id hookedDownloadNH(id self, SEL _cmd, NSURLRequest *req) {
+    typedef id (*o_t)(id, SEL, NSURLRequest *);
+    id task = g_origDownloadNH
+        ? ((o_t)g_origDownloadNH)(self, _cmd, req)
+        : ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, req);
+    if (task) maybeCapture(req, task, nil, @"下载任务（内容看落盘文件）", NO);
+    return task;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// session 工厂 hook：把 delegate 包成 NSProxy，其余参数原样透传
+// ═══════════════════════════════════════════════════════════════════════
+static id hookedSessionDQ(id self, SEL _cmd, NSURLSessionConfiguration *cfg,
+                          id delegate, NSOperationQueue *q) {
+    typedef id (*o_t)(id, SEL, NSURLSessionConfiguration *, id, NSOperationQueue *);
+    id wrapped = delegate ? [[DiditokSessionProxy alloc] initWithTarget:delegate] : nil;
+    if (!g_origSessionDQ) return nil;
+    return ((o_t)g_origSessionDQ)(self, _cmd, cfg, wrapped, q);
+}
+static id hookedSessionD(id self, SEL _cmd, NSURLSessionConfiguration *cfg, id delegate) {
+    typedef id (*o_t)(id, SEL, NSURLSessionConfiguration *, id);
+    id wrapped = delegate ? [[DiditokSessionProxy alloc] initWithTarget:delegate] : nil;
+    if (!g_origSessionD) return nil;
+    return ((o_t)g_origSessionD)(self, _cmd, cfg, wrapped);
+}
+static id hookedBgSessionDQ(id self, SEL _cmd, NSURLSessionConfiguration *cfg,
+                            id delegate, NSOperationQueue *q) {
+    typedef id (*o_t)(id, SEL, NSURLSessionConfiguration *, id, NSOperationQueue *);
+    id wrapped = delegate ? [[DiditokSessionProxy alloc] initWithTarget:delegate] : nil;
+    if (!g_origBgSessionDQ) return nil;
+    return ((o_t)g_origBgSessionDQ)(self, _cmd, cfg, wrapped, q);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// 抓包控制
+// ═══════════════════════════════════════════════════════════════════════
+static void startCapture(void) {
+    [g_stateLock lock]; g_captureEnabled = YES; g_seq = 0; g_count = 0; [g_stateLock unlock];
+    [g_mapLock lock]; [g_pendingMap removeAllObjects]; [g_bodyMap removeAllObjects]; [g_mapLock unlock];
+    NSString *header = [NSString stringWithFormat:
+        @"════════ Diditok 全量抓包  开始 %@ ════════\n", tsStr([NSDate date])];
+    [header writeToFile:captureFilePath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    setButtonColor([UIColor redColor]);
+    showToast(@"🔴 开始抓包 → diditok_capture.txt");
+}
+static void stopCapture(void) {
+    [g_stateLock lock]; g_captureEnabled = NO; int cnt = g_count; [g_stateLock unlock];
+    setButtonColor([UIColor colorWithRed:0.2 green:0.4 blue:0.9 alpha:0.9]);
+    showToast([NSString stringWithFormat:@"⏹ 已停止（共 %d 条，可分享导出）", cnt]);
+}
+// 分享导出：把 diditok_capture.txt 弹系统分享面板
+static void shareCaptureFile(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *path = captureFilePath();
+        NSDictionary *at = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+        unsigned long long sz = at ? [at fileSize] : 0;
+        if (sz == 0) { showToast(@"⚠️ 还没有抓到内容"); return; }
+        UIViewController *p = topVC();
+        if (!p) { showToast(@"❌ 找不到可用窗口"); return; }
+        UIActivityViewController *av = [[UIActivityViewController alloc]
+            initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
+        if (av.popoverPresentationController) {
+            av.popoverPresentationController.sourceView = g_floatButton ?: p.view;
+            av.popoverPresentationController.sourceRect = g_floatButton ? g_floatButton.bounds : p.view.bounds;
+        }
+        showToast([NSString stringWithFormat:@"📤 分享 diditok_capture.txt（%@）", sizeStr((NSUInteger)sz)]);
+        [p presentViewController:av animated:YES completion:nil];
+    });
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // UI 事件 target（ObjC 方法，避免 addTarget:nil 野指针）
 // ═══════════════════════════════════════════════════════════════════════
@@ -720,95 +856,33 @@ static UIViewController *topVC(void);
     return inst;
 }
 - (void)onFloatTap {
-
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *vc = topVC();
         if (!vc || !vc.view.window) vc = appWindow().rootViewController;
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Diditok"
-                                                                    message:nil
-                                                             preferredStyle:UIAlertControllerStyleActionSheet];
+        if (!vc) { showToast(@"❌ 找不到可用窗口"); return; }
 
-        [ac addAction:[UIAlertAction actionWithTitle:@"🔐 复制密文（AES-CBC）"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-            UIPasteboard.generalPasteboard.string = buildCipherText();
-            writeCipherOnly();
-            showToast(@"密文已复制");
-        }]];
+        [g_stateLock lock]; BOOL cap = g_captureEnabled; int cnt = g_count; [g_stateLock unlock];
+        UIAlertController *ac = [UIAlertController
+            alertControllerWithTitle:@"抓包"
+            message:cap ? [NSString stringWithFormat:@"🔴 正在抓包…（已记录 %d 条）", cnt]
+                        : [NSString stringWithFormat:@"⚪ 未开启（已记录 %d 条）", cnt]
+            preferredStyle:UIAlertControllerStyleActionSheet];
 
-        [ac addAction:[UIAlertAction actionWithTitle:@"👁️ 查看明文（需密码）"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-            requirePassword(vc, ^{
-                NSString *plain = buildPlainJSON();
-                UIAlertController *a2 = [UIAlertController alertControllerWithTitle:@"📄 明文凭据"
-                                                                            message:plain
-                                                                     preferredStyle:UIAlertControllerStyleAlert];
-                [a2 addAction:[UIAlertAction actionWithTitle:@"复制明文" style:UIAlertActionStyleDefault handler:^(UIAlertAction *b) {
-                    UIPasteboard.generalPasteboard.string = plain;
-                    showToast(@"明文已复制（内存中，未写盘）");
-                }]];
-                [a2 addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
-                [vc presentViewController:a2 animated:YES completion:nil];
-            });
-        }]];
+        UIAlertAction *start = [UIAlertAction actionWithTitle:@"▶️ 开始抓包"
+            style:UIAlertActionStyleDefault
+            handler:^(UIAlertAction *a) { startCapture(); }];
+        start.enabled = !cap;
+        [ac addAction:start];
 
-        [ac addAction:[UIAlertAction actionWithTitle:@"💾 保存/分享密文"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-            saveCipherAndShare();
-            showToast(@"💾 密文已存 diditok.txt，可在分享面板存到文件");
-        }]];
+        UIAlertAction *stop = [UIAlertAction actionWithTitle:@"⏹ 停止抓包"
+            style:UIAlertActionStyleDefault
+            handler:^(UIAlertAction *a) { stopCapture(); }];
+        stop.enabled = cap;
+        [ac addAction:stop];
 
-        [ac addAction:[UIAlertAction actionWithTitle:@"📡 抓包控制"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-            UIAlertController *sub = [UIAlertController alertControllerWithTitle:@"📡 抓包控制"
-                                                                         message:g_captureEnabled ? @"🔴 正在抓包…" : @"⚪ 未开启"
-                                                                  preferredStyle:UIAlertControllerStyleAlert];
-
-            UIAlertAction *start = [UIAlertAction actionWithTitle:@"▶️ 开始抓包"
-                                                            style:UIAlertActionStyleDefault
-                                                          handler:^(UIAlertAction *b) {
-                [g_harLock lock]; g_harEntries = [NSMutableArray new]; g_harSeq = 0; [g_harLock unlock];
-                g_captureEnabled = YES;
-                setButtonColor([UIColor redColor]);
-                showToast(@"🔴 开始抓包");
-            }];
-            start.enabled = !g_captureEnabled;
-            [sub addAction:start];
-
-            UIAlertAction *stop = [UIAlertAction actionWithTitle:@"⏹ 停止抓包"
-                                                           style:UIAlertActionStyleDefault
-                                                         handler:^(UIAlertAction *b) {
-                g_captureEnabled = NO;
-                setButtonColor([UIColor colorWithRed:0.1 green:0.7 blue:0.2 alpha:0.9]);
-                showToast(@"⏹ 已停止抓包（已抓到的仍在内存，可点分享导出）");
-            }];
-            stop.enabled = g_captureEnabled;
-            [sub addAction:stop];
-
-            [sub addAction:[UIAlertAction actionWithTitle:@"📤 分享导出"
-                                                    style:UIAlertActionStyleDefault
-                                                  handler:^(UIAlertAction *b) {
-                exportHarAndShare();
-            }]];
-
-            [sub addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-            [vc presentViewController:sub animated:YES completion:nil];
-        }]];
-
-        [ac addAction:[UIAlertAction actionWithTitle:@"🧪 导出诊断日志（版本/风控）"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-            NSString *p = diagLogPath();
-            if (![[NSFileManager defaultManager] fileExistsAtPath:p]) {
-                showToast(@"⚠️ 还没有日志，先复现一次「去登录」再回来导出");
-                return;
-            }
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400000000)),
-                           dispatch_get_main_queue(), ^{ shareFileNow(p); });
-        }]];
+        [ac addAction:[UIAlertAction actionWithTitle:@"📤 分享导出 TXT"
+            style:UIAlertActionStyleDefault
+            handler:^(UIAlertAction *a) { shareCaptureFile(); }]];
 
         [ac addAction:[UIAlertAction actionWithTitle:@"❌ 取消" style:UIAlertActionStyleCancel handler:nil]];
         if (ac.popoverPresentationController) {
@@ -819,7 +893,6 @@ static UIViewController *topVC(void);
     });
 }
 - (void)onPan:(UIPanGestureRecognizer *)g {
-
     static CGPoint g_dragStart, g_btnStart;
     CGPoint pt = [g translationInView:g_floatWindow.superview];
     if (g.state == UIGestureRecognizerStateBegan) { g_dragStart = pt; g_btnStart = g_floatButton.center; }
@@ -836,101 +909,14 @@ static UIViewController *topVC(void);
 @end
 
 // ═══════════════════════════════════════════════════════════════════════
-// NSURLSession hook
-// ═══════════════════════════════════════════════════════════════════════
-static id hookedDataTask1(id self, SEL _cmd, NSURLRequest *req, id handler) {
-    typedef id (*o_t)(id, SEL, NSURLRequest *, id);
-    @try { DidiRingPush(req); } @catch (NSException *e) {}
-    // 包一层 completionHandler，顺手拿到响应体（只有这样才能补手机号）
-    id wrapped = handler;
-    if (handler) {
-        void (^orig)(NSData *, NSURLResponse *, NSError *) =
-            (void (^)(NSData *, NSURLResponse *, NSError *))handler;
-        wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
-            @try { scanResponseBodyForPhone(data); } @catch (NSException *e) {}
-            @try { DidiDiagNetwork(req, resp, data); } @catch (NSException *e) {}
-            orig(data, resp, err);
-        };
-    }
-    id task = nil;
-    if (g_origDataTask1) {
-        task = ((o_t)g_origDataTask1)(self, _cmd, req, wrapped);
-    } else {
-        task = ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, req, wrapped);
-    }
-    scanHeaders(req, @"NSURLSession#dataTaskWithRequest:completionHandler:", task);
-    return task;
-}
-static id hookedDataTask2(id self, SEL _cmd, NSURLRequest *req) {
-    typedef id (*o_t)(id, SEL, NSURLRequest *);
-    @try { DidiRingPush(req); } @catch (NSException *e) {}
-    id task = nil;
-    if (g_origDataTask2) {
-        task = ((o_t)g_origDataTask2)(self, _cmd, req);
-    } else {
-        task = ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, req);
-    }
-    scanHeaders(req, @"NSURLSession#dataTaskWithRequest:", task);
-    return task;
-}
-// 第三形态：dataTaskWithURL:（滴滴部分敏感请求可能走这条路）
-static IMP g_origDataTaskURL = NULL;
-static id hookedDataTaskURL(id self, SEL _cmd, NSURL *u) {
-    typedef id (*o_t)(id, SEL, NSURL *);
-    id task = nil;
-    if (g_origDataTaskURL) {
-        task = ((o_t)g_origDataTaskURL)(self, _cmd, u);
-    } else {
-        task = ((o_t)[NSURLSession instanceMethodForSelector:_cmd])(self, _cmd, u);
-    }
-    @try {
-        NSURLRequest *r = [NSURLRequest requestWithURL:u];
-        DidiRingPush(r);
-        scanHeaders(r, @"NSURLSession#dataTaskWithURL:", task);
-    } @catch (NSException *e) {}
-    return task;
-}
-
-static NSString* hookedUserToken(id self, SEL _cmd) {
-    NSString *t = g_origUserToken ? ((NSString*(*)(id,SEL))g_origUserToken)(self, _cmd) : @"";
-    if (t.length && ![t isEqualToString:g_lastToken]) { g_lastToken = t; onCredsFound(); }
-    return t;
-}
-static NSString* hookedUserPhone(id self, SEL _cmd) {
-    NSString *p = g_origUserPhone ? ((NSString*(*)(id,SEL))g_origUserPhone)(self, _cmd) : @"";
-    if (p.length && ![p isEqualToString:g_lastPhone]) { g_lastPhone = p; onCredsFound(); }
-    return p;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// NSJSONSerialization hook —— 手机号只存在于响应体里
-// App 的每个接口返回都会过 NSJSONSerialization，在这里扫一遍最省事。
-// ═══════════════════════════════════════════════════════════════════════
-static id hookedJSONObject(id self, SEL _cmd, NSData *data, NSJSONReadingOptions opt, NSError **err) {
-    typedef id (*o_t)(id, SEL, NSData *, NSJSONReadingOptions, NSError **);
-    id obj = g_origJSON ? ((o_t)g_origJSON)(self, _cmd, data, opt, err) : nil;
-    @try {
-        if (obj && !g_lastPhone.length) {
-            int budget = 400;
-            NSString *p = DidiFindPhoneInJSON(obj, 0, &budget);
-            if (p.length) { g_lastPhone = p; onCredsFound(); }
-        }
-        DidiDiagJSON(obj);          // 诊断：把「非官方/版本」相关的服务端原文落到日志
-    } @catch (NSException *e) {}
-    return obj;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
 // 悬浮 UI
 // ═══════════════════════════════════════════════════════════════════════
-
 @interface DiditokFloatWindow : UIWindow
 @end
-
 @implementation DiditokFloatWindow
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *v = [super hitTest:point withEvent:event];
-    return (v == self) ? nil : v;
+    return (v == self) ? nil : v;   // 空白区域穿透，只吃按钮
 }
 @end
 
@@ -961,23 +947,6 @@ static UIViewController *topVC(void) {
     return vc;
 }
 
-// 通用：弹系统分享面板（分享任意文件）
-static void shareFileNow(NSString *path) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *p = topVC();
-        if (!p) { showToast(@"❌ 找不到可用窗口"); return; }
-        UIActivityViewController *av =
-            [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]]
-                                              applicationActivities:nil];
-        if (av.popoverPresentationController) {
-            av.popoverPresentationController.sourceView = g_floatButton ?: p.view;
-            av.popoverPresentationController.sourceRect = g_floatButton ? g_floatButton.bounds : p.view.bounds;
-        }
-        [p presentViewController:av animated:YES completion:nil];
-    });
-}
-
-
 static void setupFloatUI(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (g_floatWindow) return;
@@ -996,11 +965,13 @@ static void setupFloatUI(void) {
         g_floatButton.layer.borderWidth  = 2;
         g_floatButton.layer.borderColor  = [UIColor whiteColor].CGColor;
         g_floatButton.backgroundColor    = [UIColor colorWithRed:0.2 green:0.4 blue:0.9 alpha:0.9];
-        [g_floatButton setTitle:@"梦" forState:UIControlStateNormal];
+        [g_floatButton setTitle:@"抓" forState:UIControlStateNormal];
         [g_floatButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         g_floatButton.titleLabel.font = [UIFont boldSystemFontOfSize:28];
-        [g_floatButton addTarget:[DiditokActionTarget shared] action:@selector(onFloatTap) forControlEvents:UIControlEventTouchUpInside];
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:[DiditokActionTarget shared] action:@selector(onPan:)];
+        [g_floatButton addTarget:[DiditokActionTarget shared] action:@selector(onFloatTap)
+                 forControlEvents:UIControlEventTouchUpInside];
+        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
+            initWithTarget:[DiditokActionTarget shared] action:@selector(onPan:)];
         [g_floatButton addGestureRecognizer:pan];
         [g_floatWindow addSubview:g_floatButton];
 
@@ -1023,20 +994,14 @@ static void setupFloatUI(void) {
 // ═══════════════════════════════════════════════════════════════════════
 // 反检测：把自己从 dyld 的镜像表里抹掉
 //
-// 滴滴安全组件通过公开 API 枚举已加载镜像：
+// 滴滴/哈啰等安全组件通过公开 API 枚举已加载镜像：
 //   _dyld_image_count / _dyld_get_image_name / _dyld_get_image_header
 //   _dyld_get_image_vmaddr_slide / _dyld_register_func_for_add_image
 // 它们全部读同一份全局表 _dyld_all_image_infos.infoArray。
 // 所以不用 fishhook、不用改任何函数，直接改表里"我们这一条"的路径和 header，
 // 让所有枚举者看到的都是一个系统库，看不到 Diditok.dylib。
 // dyld 之后 dlopen 新镜像可能重建这张表，所以在新增镜像回调里再刷一次。
-//
-// 表结构（64 位）：
-//   +0  uint32 version
-//   +4  uint32 infoArrayCount
-//   +8  const dyld_image_info *infoArray   // 每项：loadAddr / path / modDate
 // ═══════════════════════════════════════════════════════════════════════
-
 typedef struct {
     const void *imageLoadAddress;
     const char *imageFilePath;
@@ -1117,249 +1082,19 @@ static void DidiHideSelf(void) {
 
 // ═══════════════════════════════════════════════════════════════════════
 // 反检测（「非官方或低版本」）
-// 实测依据：
-//   · SecCodeCheckValidity / SecStaticCodeCheckValidity / SecCodeCopySigningInformation
-//     在整个 IPA 里 0 处引用 → 不是本地验签
-//   · 主二进制有 WSGAppAttestManager / WSGDeviceCheckManager / isAppAttestEnabled /
-//     isAppAttestEntitlementPresent / isAppCracked / isJailbroken、DeviceCheck 的
-//     attestKey:clientDataHash:completionHandler: → 重签后 App Attest 必然失败
-//   · 提示文案不在包内（服务端下发）→ 只能削弱客户端上报的完整性信号
+//   · DCAppAttestService.isSupported → NO（重签后必然失败，让它走降级）
+//   · isAppAttestEnabled / isAppCracked / isJailbroken 等布尔开关压平为 NO
+//   · App 包内 Diditok 相关文件在 NSFileManager 枚举里隐藏
 // ═══════════════════════════════════════════════════════════════════════
 static BOOL DidiReturnNO(id self, SEL _cmd) { return NO; }
-// setter 一律 no-op（注意不调用原实现）：检测方把 YES 写进 cracked/jb 数据模型的
-// 路径整体掐断，数据快照无论什么时候缓存读到的都是“干净”状态。
-// 不做包装转发 → 不需要 per-class 槽位，幂等安全。
-static void DidiSetterNoop(id self, SEL _cmd) { }
 
-// 把「是否破解/越狱/可证明」这类布尔方法统一改成 NO（只认 BOOL 返回，避免误伤）
-// ⚠️ iOS 12+ clang 对 BOOL 的类型编码是 'B'（老 ABI 是 'c'），必须两者都接——
-//    只认 'c' 的话 isCracked(TB,...) 这组整个空转，上一版就是这么失误的。
 static void DidiSuppressIntegrityFlags(void) {
-    static const char *getters[] = {
+    static const char *names[] = {
         "isAppAttestEnabled", "isAppAttestEntitlementPresent",
         "isAppCracked", "isCracked", "isJailbroken", "isJailBreak", "isJailBroken",
-        "isDeviceJailbroken", "isDeviceCracked", "hasCydia", "isPiracy",
-        "isDeviceCheckEnabled"
+        "isDeviceJailbroken", "isDeviceCracked", "hasCydia", "isPiracy"
     };
-    static const char *setters[] = {
-        "setIsCracked:", "setIsAppCracked:", "setIsJailBreak:", "setIsJailBroken:",
-        "setIsJailbroken:", "setIsDeviceJailbroken:", "setIsDeviceCracked:",
-        "setHasCydia:", "setIsPiracy:"
-    };
-    int ng = (int)(sizeof(getters) / sizeof(getters[0]));
-    int ns = (int)(sizeof(setters) / sizeof(setters[0]));
-    int total = objc_getClassList(NULL, 0);
-    if (total <= 0) return;
-    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)total);
-    if (!classes) return;
-    total = objc_getClassList(classes, total);
-    int hooked = 0, hookedSet = 0;
-    for (int i = 0; i < total; i++) {
-        Class c = classes[i];
-        for (int j = 0; j < ng; j++) {
-            SEL s = sel_registerName(getters[j]);
-            Method m = class_getInstanceMethod(c, s);
-            if (m) {
-                const char *t = method_getTypeEncoding(m);
-                if (t && (t[0] == 'B' || t[0] == 'c')) {  // 'B'/'c' = BOOL 双 ABI 都接
-                    method_setImplementation(m, (IMP)DidiReturnNO);
-                    hooked++;
-                }
-            }
-            Method cm = class_getClassMethod(c, s);
-            if (cm) {
-                const char *t = method_getTypeEncoding(cm);
-                if (t && (t[0] == 'B' || t[0] == 'c')) {
-                    method_setImplementation(cm, (IMP)DidiReturnNO);
-                    hooked++;
-                }
-            }
-        }
-        for (int j = 0; j < ns; j++) {
-            SEL s = sel_registerName(setters[j]);
-            Method m = class_getInstanceMethod(c, s);
-            if (m) {
-                const char *t = method_getTypeEncoding(m);
-                if (t && t[0] == 'v') {                    // void 返回 setter
-                    method_setImplementation(m, (IMP)DidiSetterNoop);
-                    hookedSet++;
-                }
-            }
-        }
-    }
-    free(classes);
-    NSLog(@"[Diditok] ✓ 完整性开关已压平 getter=%d setter=%d", hooked, hookedSet);
-    DidiDiagAppend([NSString stringWithFormat:
-        @"\n===== [diag] 完整性开关压平 getter=%d setter=%d =====\n", hooked, hookedSet]);
-}
-
-// DCAppAttestService 在重签包里一定不可用，直接让它自报不支持（SDK 会走降级路径）
-static void DidiDisableAppAttest(void) {
-    Class att = NSClassFromString(@"DCAppAttestService");
-    if (!att) { NSLog(@"[Diditok] ⚠️ DCAppAttestService 不存在"); return; }
-    Method m = class_getInstanceMethod(att, @selector(isSupported));
-    if (m) {
-        method_setImplementation(m, (IMP)DidiReturnNO);
-        NSLog(@"[Diditok] ✓ DCAppAttestService.isSupported → NO");
-        DidiDiagAppend(@"\n===== [diag] DCAppAttestService.isSupported → NO 已安装 =====\n");
-    }
-}
-
-// 让本 dylib 在文件系统枚举里「不存在」（in-memory 隐藏之前做过，对磁盘扫描无效）
-// 宽松签/个人证书侧载的包和 App Store 官方包有两个决定性差异，这里一并抹平：
-//   1) 多出 embedded.mobileprovision（官方包没有）→ 侧载痕迹 → 「非官方」
-//   2) 少了 App Store 收据（官方包装机时系统写入）→ 本地校验会挂
-// 正确方向：profile=不存在、收据=存在，都按官方包的样子来。
-static IMP g_origContentsOfDir = NULL;
-static IMP g_origSubpathsOfDir = NULL;
-static IMP g_origFileExists     = NULL;
-static IMP g_origIsReadable     = NULL;
-static IMP g_origContentsAt     = NULL;
-static IMP g_origAttrOfItem     = NULL;
-static IMP g_origDataOfFile1    = NULL;
-static IMP g_origDataOfFile2    = NULL;
-
-// 官方包应存在而侧载包没有的「App Store 收据」真实路径（装 hook 前抓取的原生值）
-static NSString *g_realReceiptPath = nil;
-
-static BOOL DidiIsOurName(NSString *s) {
-    if (!s.length) return NO;
-    NSString *low = s.lowercaseString;
-    return [low containsString:@"diditok"];
-}
-// 只隐藏「App 包内」的痕迹；Documents 里的 diditok.txt / diditok_full.har 必须照常可见（分享要用）
-static BOOL DidiInAppBundle(NSString *path) {
-    return path.length && [path.lowercaseString containsString:@".app"];
-}
-// 侧载痕迹：宽松签安装才会出现 embedded.mobileprovision（官方 App Store 包没有）
-static BOOL DidiIsTraceFile(NSString *path) {
-    if (!path.length) return NO;
-    NSString *low = path.lowercaseString;
-    if ([low containsString:@"mobileprovision"]) return YES;
-    return NO;
-}
-// 官方包里应该存在的商店收据路径（fileExists 目录列举 hook 用它放行/提供假内容）
-static BOOL DidiIsReceiptPath(NSString *path) {
-    if (!path || !g_realReceiptPath.length) return NO;
-    return [path isEqualToString:g_realReceiptPath];
-}
-static NSData *DidiFakeReceiptData(void) {
-    static NSData *d; static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSString *s = [NSString stringWithFormat:
-            @"{\"receipt\":{\"bundle_id\":\"com.xiaojukeji.didi\","
-            @"\"application_version\":\"%@\","
-            @"\"creation_date\":\"2026-01-01\",\"opaque\":\"diditok\"},"
-            @"\"signature\":\"diditok\"}", DIDITOK_SPOOF_VERSION];
-        d = [s dataUsingEncoding:NSUTF8StringEncoding];
-    });
-    return d;
-}
-static NSArray *hookedContentsOfDir(id self, SEL _cmd, NSString *path, NSError **err) {
-    typedef NSArray *(*o_t)(id, SEL, NSString *, NSError **);
-    NSArray *arr = ((o_t)g_origContentsOfDir)(self, _cmd, path, err);
-    if (!arr.count || !DidiInAppBundle(path)) return arr;
-    NSMutableArray *out = [NSMutableArray arrayWithCapacity:arr.count];
-    for (NSString *x in arr) {
-        if ([x isKindOfClass:[NSString class]] &&
-            (DidiIsOurName(x) || [x.lowercaseString containsString:@"mobileprovision"])) continue;
-        [out addObject:x];
-    }
-    return out.count == arr.count ? arr : out;
-}
-static NSArray *hookedSubpathsOfDir(id self, SEL _cmd, NSString *path, NSError **err) {
-    typedef NSArray *(*o_t)(id, SEL, NSString *, NSError **);
-    NSArray *arr = ((o_t)g_origSubpathsOfDir)(self, _cmd, path, err);
-    if (!arr.count || !DidiInAppBundle(path)) return arr;
-    NSMutableArray *out = [NSMutableArray arrayWithCapacity:arr.count];
-    for (NSString *x in arr) {
-        if ([x isKindOfClass:[NSString class]] &&
-            (DidiIsOurName(x) || [x.lowercaseString containsString:@"mobileprovision"])) continue;
-        [out addObject:x];
-    }
-    return out.count == arr.count ? arr : out;
-}
-static BOOL hookedFileExists(id self, SEL _cmd, NSString *path) {
-    typedef BOOL (*o_t)(id, SEL, NSString *);
-    if (DidiIsTraceFile(path) && DidiInAppBundle(path)) return NO;
-    if (DidiIsReceiptPath(path)) return YES;        // 官方包装机就有，侧载包没有 → 放行
-    return ((o_t)g_origFileExists)(self, _cmd, path);
-}
-static BOOL hookedIsReadable(id self, SEL _cmd, NSString *path) {
-    typedef BOOL (*o_t)(id, SEL, NSString *);
-    if (DidiIsTraceFile(path) && DidiInAppBundle(path)) return NO;
-    if (DidiIsReceiptPath(path)) return YES;
-    return ((o_t)g_origIsReadable)(self, _cmd, path);
-}
-static NSData *hookedContentsAt(id self, SEL _cmd, NSString *path) {
-    typedef NSData *(*o_t)(id, SEL, NSString *);
-    if (DidiIsTraceFile(path) && DidiInAppBundle(path)) return nil;
-    if (DidiIsReceiptPath(path)) return DidiFakeReceiptData();
-    return ((o_t)g_origContentsAt)(self, _cmd, path);
-}
-static id hookedAttrOfItem(id self, SEL _cmd, NSString *path, NSError **err) {
-    typedef id (*o_t)(id, SEL, NSString *, NSError **);
-    if (DidiIsTraceFile(path) && DidiInAppBundle(path)) { if (err) *err = nil; return nil; }
-    if (DidiIsReceiptPath(path)) {
-        id a = [NSDictionary dictionaryWithObjectsAndKeys:
-                @(DidiFakeReceiptData().length), NSFileSize,
-                [NSDate dateWithTimeIntervalSince1970:1767225600], NSFileModificationDate, nil];
-        if (err) *err = nil;
-        return a;
-    }
-    return ((o_t)g_origAttrOfItem)(self, _cmd, path, err);
-}
-static NSData *hookedDataOfFile1(id self, SEL _cmd, NSString *path) {
-    typedef NSData *(*o_t)(id, SEL, NSString *);
-    if (DidiIsTraceFile(path) && DidiInAppBundle(path)) return nil;
-    if (DidiIsReceiptPath(path)) return DidiFakeReceiptData();
-    return ((o_t)g_origDataOfFile1)(self, _cmd, path);
-}
-static NSData *hookedDataOfFile2(id self, SEL _cmd, NSString *path, NSDataReadingOptions opt, NSError **err) {
-    typedef NSData *(*o_t)(id, SEL, NSString *, NSDataReadingOptions, NSError **);
-    if (DidiIsTraceFile(path) && DidiInAppBundle(path)) return nil;
-    if (DidiIsReceiptPath(path)) return DidiFakeReceiptData();
-    return ((o_t)g_origDataOfFile2)(self, _cmd, path, opt, err);
-}
-
-static void DidiHideDylibFromFS(void) {
-    Class fm = NSClassFromString(@"NSFileManager");
-    if (!fm) return;
-    DidiHook(fm, NSSelectorFromString(@"contentsOfDirectoryAtPath:error:"),
-             (IMP)hookedContentsOfDir, &g_origContentsOfDir);
-    DidiHook(fm, NSSelectorFromString(@"subpathsOfDirectoryAtPath:error:"),
-             (IMP)hookedSubpathsOfDir, &g_origSubpathsOfDir);
-    DidiHook(fm, NSSelectorFromString(@"fileExistsAtPath:"),
-             (IMP)hookedFileExists, &g_origFileExists);
-    DidiHook(fm, NSSelectorFromString(@"isReadableFileAtPath:"),
-             (IMP)hookedIsReadable, &g_origIsReadable);
-    DidiHook(fm, NSSelectorFromString(@"contentsAtPath:"),
-             (IMP)hookedContentsAt, &g_origContentsAt);
-    DidiHook(fm, NSSelectorFromString(@"attributesOfItemAtPath:error:"),
-             (IMP)hookedAttrOfItem, &g_origAttrOfItem);
-    Class dc = NSClassFromString(@"NSData");
-    if (dc) {
-        DidiHook(dc, @selector(dataWithContentsOfFile:),
-                 (IMP)hookedDataOfFile1, &g_origDataOfFile1);
-        DidiHook(dc, @selector(dataWithContentsOfFile:options:error:),
-                 (IMP)hookedDataOfFile2, &g_origDataOfFile2);
-    }
-    NSLog(@"[Diditok] ✓ 文件系统枚举已过滤 Diditok / mobileprovision");
-    DidiDiagAppend(@"\n===== [diag] 文件系统枚举过滤 (Diditok/mobileprovision/收据放行) 已安装 =====\n");
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// 侧载身份三件套（宽松签/个人证书都中招）：
-//   1) 所有类的 getMobileProvision 一律返回 nil（官方 App Store 包无描述文件）
-//   2) appStoreReceiptURL 指向确实存在的假收据（官方包必有收据文件）
-//   3) CFBundleShortVersionString / infoDictionary → 伪装成 App Store 最新版
-// ═══════════════════════════════════════════════════════════════════════
-static IMP g_origGetProfileAt = NULL;
-
-static id hookedGetProvisionNil(id self) { return nil; }
-
-static void DidiHideProvisionReader(void) {
-    SEL sel = NSSelectorFromString(@"getMobileProvision");
+    int n = (int)(sizeof(names) / sizeof(names[0]));
     int total = objc_getClassList(NULL, 0);
     if (total <= 0) return;
     Class *classes = (Class *)malloc(sizeof(Class) * (size_t)total);
@@ -1368,108 +1103,83 @@ static void DidiHideProvisionReader(void) {
     int hooked = 0;
     for (int i = 0; i < total; i++) {
         Class c = classes[i];
-        Method m = class_getInstanceMethod(c, sel);
-        if (m) {
-            const char *t = method_getTypeEncoding(m);
-            if (t && t[0] == '@') {                       // 返回对象类型才替换
-                g_origGetProfileAt = method_getImplementation(m);
-                method_setImplementation(m, (IMP)hookedGetProvisionNil);
-                hooked++;
+        for (int j = 0; j < n; j++) {
+            SEL s = sel_registerName(names[j]);
+            Method m = class_getInstanceMethod(c, s);
+            if (m) {
+                const char *t = method_getTypeEncoding(m);
+                if (t && t[0] == 'c') {                 // 'c' = BOOL / char
+                    method_setImplementation(m, (IMP)DidiReturnNO);
+                    hooked++;
+                }
             }
-        }
-        Method cm = class_getClassMethod(c, sel);
-        if (cm) {
-            const char *t = method_getTypeEncoding(cm);
-            if (t && t[0] == '@') {
-                method_setImplementation(cm, (IMP)hookedGetProvisionNil);
-                hooked++;
+            Method cm = class_getClassMethod(c, s);
+            if (cm) {
+                const char *t = method_getTypeEncoding(cm);
+                if (t && t[0] == 'c') {
+                    method_setImplementation(cm, (IMP)DidiReturnNO);
+                    hooked++;
+                }
             }
         }
     }
     free(classes);
-    NSLog(@"[Diditok] ✓ getMobileProvision 已归零 %d 处", hooked);
-    DidiDiagAppend([NSString stringWithFormat:
-        @"\n===== [diag] getMobileProvision 已归零 %d 处 =====\n", hooked]);
+    NSLog(@"[Diditok] ✓ 完整性开关已压平 %d 处", hooked);
 }
 
-static NSURL *(*g_origReceiptURL)(id, SEL) = NULL;
-static NSURL *hookedReceiptURL(id self, SEL _cmd) {
-    NSURL *u = g_origReceiptURL ? g_origReceiptURL(self, _cmd) : nil;
-    BOOL exists = u && [[NSFileManager defaultManager] fileExistsAtPath:u.path ?: @""];
-    if (u && exists) return u;
-    // 官方包必有收据，侧载包没有 → 给一个真实存在的假收据路径
-    NSString *fake = [documentsDir() stringByAppendingPathComponent:@"dd_fake_receipt.bin"];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:fake]) {
-        [DidiFakeReceiptData() writeToFile:fake options:NSDataWritingAtomic error:nil];
-    }
-    return [NSURL fileURLWithPath:fake];
-}
-
-static void DidiFakeReceipt(void) {
-    @try {
-        Class b = NSClassFromString(@"NSBundle");
-        if (!b) return;
-        // 先抓原生返回值，供 fileExists/读内容 hook 精确放行
-        @try { g_realReceiptPath = [NSBundle mainBundle].appStoreReceiptURL.path; } @catch (NSException *e) {}
-        Method m = class_getInstanceMethod(b, @selector(appStoreReceiptURL));
-        if (m) {
-            g_origReceiptURL = (NSURL *(*)(id, SEL))method_getImplementation(m);
-            method_setImplementation(m, (IMP)hookedReceiptURL);
-            NSLog(@"[Diditok] ✓ appStoreReceiptURL → 伪装收据  real=%@", g_realReceiptPath ?: @"(无)");
-            DidiDiagAppend([NSString stringWithFormat:
-                @"\n===== [diag] 收据伪装已安装 realReceipt=%@ fakeLen=%lu =====\n",
-                g_realReceiptPath ?: @"(无)", (unsigned long)DidiFakeReceiptData().length]);
-        }
-    } @catch (NSException *e) {
-        NSLog(@"[Diditok] ✗ fake receipt: %@", e);
+static void DidiDisableAppAttest(void) {
+    Class att = NSClassFromString(@"DCAppAttestService");
+    if (!att) { NSLog(@"[Diditok] ⚠️ DCAppAttestService 不存在"); return; }
+    Method m = class_getInstanceMethod(att, @selector(isSupported));
+    if (m) {
+        method_setImplementation(m, (IMP)DidiReturnNO);
+        NSLog(@"[Diditok] ✓ DCAppAttestService.isSupported → NO");
     }
 }
 
-static IMP g_origInfoKey = NULL;
-static id hookedInfoForKey(id self, SEL _cmd, NSString *key) {
-    id v = g_origInfoKey ? ((id(*)(id, SEL, NSString *))g_origInfoKey)(self, _cmd, key) : nil;
-    if ([key isKindOfClass:[NSString class]] &&
-        [key isEqualToString:@"CFBundleShortVersionString"] && v) {
-        return DIDITOK_SPOOF_VERSION;
-    }
-    return v;
+// 让本 dylib 在文件系统枚举里「不存在」（in-memory 隐藏对磁盘扫描无效）
+static IMP g_origContentsOfDir = NULL;
+static IMP g_origFileExists     = NULL;
+
+static BOOL DidiIsOurName(NSString *s) {
+    if (!s.length) return NO;
+    NSString *low = s.lowercaseString;
+    return [low containsString:@"diditok"];
 }
-static IMP g_origInfoDict = NULL;
-static id hookedInfoDict(id self, SEL _cmd) {
-    id d = g_origInfoDict ? ((id(*)(id, SEL))g_origInfoDict)(self, _cmd) : nil;
-    if ([d isKindOfClass:[NSDictionary class]]) {
-        id cur = ((NSDictionary *)d)[@"CFBundleShortVersionString"];
-        if ([cur isKindOfClass:[NSString class]] && [(NSString *)cur length] &&
-            ![(NSString *)cur isEqualToString:DIDITOK_SPOOF_VERSION]) {
-            NSMutableDictionary *m = [(NSDictionary *)d mutableCopy];
-            m[@"CFBundleShortVersionString"] = DIDITOK_SPOOF_VERSION;
-            return m;
-        }
-    }
-    return d;
+// 只隐藏「App 包内」的痕迹；Documents 里的 diditok_capture.txt 必须照常可见（分享要用）
+static BOOL DidiInAppBundle(NSString *path) {
+    return path.length && [path.lowercaseString containsString:@".app"];
 }
-static void DidiSpoofVersionStrings(void) {
-    Class b = NSClassFromString(@"NSBundle");
-    if (!b) return;
-    Method m1 = class_getInstanceMethod(b, @selector(objectForInfoDictionaryKey:));
-    if (m1) {
-        g_origInfoKey = method_getImplementation(m1);
-        method_setImplementation(m1, (IMP)hookedInfoForKey);
+static NSArray *hookedContentsOfDir(id self, SEL _cmd, NSString *path, NSError **err) {
+    typedef NSArray *(*o_t)(id, SEL, NSString *, NSError **);
+    NSArray *arr = ((o_t)g_origContentsOfDir)(self, _cmd, path, err);
+    if (!arr.count || !DidiInAppBundle(path)) return arr;
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:arr.count];
+    for (id x in arr) {
+        if ([x isKindOfClass:[NSString class]] && DidiIsOurName(x)) continue;
+        [out addObject:x];
     }
-    Method m2 = class_getInstanceMethod(b, @selector(infoDictionary));
-    if (m2) {
-        g_origInfoDict = method_getImplementation(m2);
-        method_setImplementation(m2, (IMP)hookedInfoDict);
-    }
-    NSLog(@"[Diditok] ✓ 版本伪装 CFBundleShortVersionString → %@", DIDITOK_SPOOF_VERSION);
-    DidiDiagAppend([NSString stringWithFormat:
-        @"\n===== [diag] 版本伪装(NSBundle 层)→%@ 已安装 =====\n", DIDITOK_SPOOF_VERSION]);
+    return out.count == arr.count ? arr : out;
+}
+static BOOL hookedFileExists(id self, SEL _cmd, NSString *path) {
+    typedef BOOL (*o_t)(id, SEL, NSString *);
+    if (DidiInAppBundle(path) && DidiIsOurName(path)) return NO;
+    return ((o_t)g_origFileExists)(self, _cmd, path);
+}
+static void DidiHideDylibFromFS(void) {
+    Class fm = NSClassFromString(@"NSFileManager");
+    if (!fm) return;
+    DidiHook(fm, NSSelectorFromString(@"contentsOfDirectoryAtPath:error:"),
+             (IMP)hookedContentsOfDir, &g_origContentsOfDir);
+    DidiHook(fm, NSSelectorFromString(@"fileExistsAtPath:"),
+             (IMP)hookedFileExists, &g_origFileExists);
+    NSLog(@"[Diditok] ✓ 文件系统枚举已过滤 Diditok");
 }
 
-// ⚠️ 这三层必须等 App 启动完再装。
+// ⚠️ 这些必须等 App 启动完再装。
 // 在 dyld 初始化阶段调用 class_getInstanceMethod 会触发任意类的 +initialize，
 // 那些类里再用 dispatch_once / mutex，会在 objc 运行时锁持有的情况下判定死锁，
-// 抛 std::system_error → _objc_terminate → abort（崩溃日志：diditok_init → abort）。
+// 抛 std::system_error → _objc_terminate → abort。
 static void DidiInstallGuards(void) {
     static BOOL done = NO;
     if (done) return;
@@ -1477,9 +1187,6 @@ static void DidiInstallGuards(void) {
     @try { DidiHideDylibFromFS();  } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hideFS: %@", e); }
     @try { DidiDisableAppAttest(); } @catch (NSException *e) { NSLog(@"[Diditok] ✗ attest: %@", e); }
     @try { DidiSuppressIntegrityFlags(); } @catch (NSException *e) { NSLog(@"[Diditok] ✗ flags: %@", e); }
-    @try { DidiHideProvisionReader(); } @catch (NSException *e) { NSLog(@"[Diditok] ✗ profile: %@", e); }
-    @try { DidiFakeReceipt();        } @catch (NSException *e) { NSLog(@"[Diditok] ✗ receipt: %@", e); }
-    @try { DidiSpoofVersionStrings(); } @catch (NSException *e) { NSLog(@"[Diditok] ✗ version: %@", e); }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1489,79 +1196,53 @@ __attribute__((constructor))
 static void diditok_init(void) {
     @autoreleasepool {
       @try {
-        NSLog(@"[Diditok] ▶ constructor fired");
+        NSLog(@"[Diditok] ▶ constructor fired (capture-only)");
         DidiHideSelf();
 
-        g_harLock    = [NSLock new];
-        g_harEntries = [NSMutableArray new];
-        g_reAu       = [NSRegularExpression regularExpressionWithPattern:@"secdd-authentication:\\s*(\\S+)" options:0 error:nil];
+        g_stateLock  = [NSLock new];
+        g_mapLock    = [NSLock new];
+        g_pendingMap = [NSMutableDictionary new];
+        g_bodyMap    = [NSMutableDictionary new];
+        g_writeQueue = dispatch_queue_create("diditok.capture.write", DISPATCH_QUEUE_SERIAL);
 
-                // hook NSURLSession（ObjC runtime 交换，无需 Substrate）
         Class sessCls = NSClassFromString(@"NSURLSession");
         if (sessCls) {
-            SEL s1 = NSSelectorFromString(@"dataTaskWithRequest:completionHandler:");
-            SEL s2 = NSSelectorFromString(@"dataTaskWithRequest:");
-            @try {
-                DidiHook(sessCls, s1, (IMP)hookedDataTask1, &g_origDataTask1);
-                NSLog(@"[Diditok] ✓ hooked NSURLSession.dataTaskWithRequest:completionHandler:");
-            } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook s1 failed: %@", e); }
-            @try {
-                DidiHook(sessCls, s2, (IMP)hookedDataTask2, &g_origDataTask2);
-                NSLog(@"[Diditok] ✓ hooked NSURLSession.dataTaskWithRequest:");
-            } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook s2 failed: %@", e); }
-            // 第三形态 dataTaskWithURL: —— 用于补捕获不走 request 变体的请求（迭代 3）
-            @try {
-                SEL s3 = NSSelectorFromString(@"dataTaskWithURL:");
-                DidiHook(sessCls, s3, (IMP)hookedDataTaskURL, &g_origDataTaskURL);
-                NSLog(@"[Diditok] ✓ hooked NSURLSession.dataTaskWithURL:");
-                DidiDiagAppend(@"\n===== [diag] NSURLSession.dataTaskWithURL: 已安装 =====\n");
-            } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook s3 failed: %@", e); }
+            hookInstanceMethod(sessCls, "dataTaskWithRequest:completionHandler:",
+                               (IMP)hookedDataTaskCH, &g_origDataTaskCH, "dataTaskWithRequest:completionHandler:");
+            hookInstanceMethod(sessCls, "dataTaskWithRequest:",
+                               (IMP)hookedDataTaskNH, &g_origDataTaskNH, "dataTaskWithRequest:");
+            hookInstanceMethod(sessCls, "dataTaskWithURL:completionHandler:",
+                               (IMP)hookedDataTaskURLCH, &g_origDataTaskURLCH, "dataTaskWithURL:completionHandler:");
+            hookInstanceMethod(sessCls, "dataTaskWithURL:",
+                               (IMP)hookedDataTaskURLNH, &g_origDataTaskURLNH, "dataTaskWithURL:");
+            hookInstanceMethod(sessCls, "uploadTaskWithRequest:fromData:completionHandler:",
+                               (IMP)hookedUploadCH, &g_origUploadDataCH, "uploadTaskWithRequest:fromData:completionHandler:");
+            hookInstanceMethod(sessCls, "uploadTaskWithRequest:fromData:",
+                               (IMP)hookedUploadNH, &g_origUploadDataNH, "uploadTaskWithRequest:fromData:");
+            hookInstanceMethod(sessCls, "uploadTaskWithStreamedRequest:",
+                               (IMP)hookedUploadStream, &g_origUploadStream, "uploadTaskWithStreamedRequest:");
+            hookInstanceMethod(sessCls, "downloadTaskWithRequest:completionHandler:",
+                               (IMP)hookedDownloadCH, &g_origDownloadCH, "downloadTaskWithRequest:completionHandler:");
+            hookInstanceMethod(sessCls, "downloadTaskWithURL:completionHandler:",
+                               (IMP)hookedDownloadURLCH, &g_origDownloadURLCH, "downloadTaskWithURL:completionHandler:");
+            hookInstanceMethod(sessCls, "downloadTaskWithRequest:",
+                               (IMP)hookedDownloadNH, &g_origDownloadNH, "downloadTaskWithRequest:");
+            hookClassMethod(sessCls, "sessionWithConfiguration:delegate:delegateQueue:",
+                            (IMP)hookedSessionDQ, &g_origSessionDQ, "+sessionWithConfiguration:delegate:delegateQueue:");
+            hookClassMethod(sessCls, "sessionWithConfiguration:delegate:",
+                            (IMP)hookedSessionD, &g_origSessionD, "+sessionWithConfiguration:delegate:");
+            hookClassMethod(sessCls, "backgroundSessionWithConfiguration:delegate:delegateQueue:",
+                            (IMP)hookedBgSessionDQ, &g_origBgSessionDQ, "+backgroundSessionWithConfiguration:delegate:delegateQueue:");
         } else {
             NSLog(@"[Diditok] ⚠️ NSURLSession not found (shouldn't happen)");
         }
 
-        // hook NSJSONSerialization：手机号只出现在响应体里，Uniform 拦截点
-        Class jsonCls = NSClassFromString(@"NSJSONSerialization");
-        if (jsonCls) {
-            @try {
-                Method jm = class_getClassMethod(jsonCls, @selector(JSONObjectWithData:options:error:));
-                if (jm) {
-                    g_origJSON = method_getImplementation(jm);
-                    method_setImplementation(jm, (IMP)hookedJSONObject);
-                    NSLog(@"[Diditok] ✓ hooked NSJSONSerialization.JSONObjectWithData:options:error:");
-                }
-            } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook JSON failed: %@", e); }
-        }
-
-        // ✅ 修 2: UserInfoCallback — 多候选类名，逐个试
-        for (NSString *name in @[@"UserInfoCallback",
-                                 @"com.didi.carhailing.component.mapflow.util.UserInfoCallback"]) {
-            Class c = NSClassFromString(name);
-            if (!c) continue;
-            NSLog(@"[Diditok] ✓ UserInfoCallback class = %@", name);
-            @try {
-                DidiHook(c, @selector(getToken), (IMP)hookedUserToken, &g_origUserToken);
-            } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook getToken: %@", e); }
-            @try {
-                DidiHook(c, @selector(getPhoneNumber), (IMP)hookedUserPhone, &g_origUserPhone);
-            } @catch (NSException *e) { NSLog(@"[Diditok] ✗ hook getPhoneNumber: %@", e); }
-            break;
-        }
-
-        // ✅ 修 3: AES 自验（CCCrypt 3 个 C）
-        @try {
-            NSString *demo = @"{\"Phone\":\"13800000000\",\"token\":\"demo\",\"auToken\":\"demoA\",\"ddfp\":\"demoD\"}";
-            NSString *enc = aesEncryptString(demo);
-            NSLog(@"[Diditok] ✓ AES self-test OK  len=%lu", (unsigned long)enc.length);
-        } @catch (NSException *e) {
-            NSLog(@"[Diditok] ✗ AES self-test FAILED: %@", e);
-        }
-
-        // 等 App 完全启动后再建 UIWindow
-        g_launchObserver = [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification *note) {
+        // 等 App 完全启动后再建 UIWindow + 装反检测
+        g_launchObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationDidFinishLaunchingNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *note) {
             NSLog(@"[Diditok] ▶ UIApplicationDidFinishLaunching → setupFloatUI");
             DidiInstallGuards();
             setupFloatUI();
@@ -1574,7 +1255,7 @@ static void diditok_init(void) {
             setupFloatUI();
         });
 
-        NSLog(@"[Diditok] ✅ constructor done  password=%@", DIDITOK_PASSWORD);
+        NSLog(@"[Diditok] ✅ constructor done (capture-only)");
       } @catch (NSException *e) {
         NSLog(@"[Diditok] ✗ constructor exception: %@", e);
       }

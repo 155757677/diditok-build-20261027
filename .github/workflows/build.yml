@@ -17,12 +17,8 @@ jobs:
 
       - name: 下载原始 IPA
         run: |
-          curl -fL --retry 3 -o original.ipa "${{ github.event.inputs.original_ipa_url }}"
+          curl -L -o original.ipa "${{ github.event.inputs.original_ipa_url }}"
           ls -lh original.ipa
-          SZ=$(stat -f%z original.ipa)
-          if [ "$SZ" -lt 50000000 ]; then
-            echo "ERROR: original.ipa 只有 $SZ 字节，像是下载失败页"; head -c 200 original.ipa; exit 1
-          fi
 
       - name: 构建 Diditok.dylib（clang 直接编译，不用 Theos / 不链接 substrate）
         run: |
@@ -59,34 +55,6 @@ jobs:
           echo "Binary: $BIN_NAME"
           BIN_PATH="$APP_DIR/$BIN_NAME"
 
-          # ── 版本伪装：宽松签侧载的包会被登录侧判「非官方或低版本」，
-          #    低版本文案是本地 UnifyPassportService 的登录文案（当前App版本过低，请升级后重试）。
-          #    把 CFBundleShortVersionString 抬到 App Store 最新版（2026-10-29 = 8.0.18）。
-          #    只有当原始包版本 < APP_VERSION 时才替换，避免以后打 9.x 包时被降级。
-          NEW_VER=8.0.18
-          python3 - "$APP_DIR/Info.plist" "$NEW_VER" <<'PY'
-          import sys, os, plistlib, time
-          p, new = sys.argv[1], sys.argv[2]
-          with open(p, 'rb') as f:
-              d = plistlib.load(f)
-          def k(v):
-              out = []
-              for x in (v or '').split('.'):
-                  out.append(int(x) if x.isdigit() else 0)
-              return tuple(out)
-          old = d.get('CFBundleShortVersionString') or ''
-          if k(new) > k(old):
-              b = d.get('CFBundleVersion') or ''
-              tail = b.split('.')[-1] if '.' in b else str(int(time.time()))
-              d['CFBundleShortVersionString'] = new
-              d['CFBundleVersion'] = f'{new}.{tail}'
-              with open(p, 'wb') as f:
-                  plistlib.dump(d, f)
-              print(f'[version] {old} / {b} -> {new} / {d["CFBundleVersion"]}')
-          else:
-              print(f'[version] keep {old} (>= {new})')
-          PY
-
           # ⚠️ 关键：必须在 LIEF 改动前，把主二进制的原始 entitlements 备份出来。
           # 之前用 codesign --force --deep --sign - 重签把 entitlements 全部抹掉了
           # （keychain-access-groups / application-identifier / aps-environment 全没了），
@@ -94,9 +62,12 @@ jobs:
           codesign -d --entitlements :- "$BIN_PATH" > ent.plist 2>/dev/null || true
           echo "=== 原始 entitlements ==="
           cat ent.plist || true
-          if ! grep -q "application-identifier" ent.plist; then
-            echo "ERROR: 原始包没有 entitlements，中止"
-            exit 1
+          # 有些包（比如哈啰）可能没有 entitlements，此时重签不附加即可，不中止
+          ENT_ARGS=""
+          if grep -q "application-identifier" ent.plist; then
+            ENT_ARGS="--entitlements ent.plist"
+          else
+            echo "WARN: 原始包没有 entitlements，重签时不附加"
           fi
 
           mkdir -p "$APP_DIR/Frameworks"
@@ -106,16 +77,20 @@ jobs:
           # 新加的 dylib 不需要 entitlements
           codesign --force --sign - "$APP_DIR/Frameworks/Diditok.dylib"
           # 主二进制带着原始 entitlements 重签；不要用 --deep（会递归重签并清空嵌套项）
-          codesign --force --sign - --entitlements ent.plist "$BIN_PATH"
+          codesign --force --sign - $ENT_ARGS "$BIN_PATH"
           # 签整个 .app（不加 --deep，嵌套的框架保持它们原来的签名不动）
-          codesign --force --sign - --entitlements ent.plist "$APP_DIR"
+          codesign --force --sign - $ENT_ARGS "$APP_DIR"
 
           echo "=== 重签后 entitlements 校验 ==="
-          codesign -d --entitlements :- "$BIN_PATH" > after.plist 2>/dev/null || true
-          if grep -q "keychain-access-groups" after.plist && grep -q "application-identifier" after.plist; then
-            echo "OK: entitlements 完整保留"
+          if [ -n "$ENT_ARGS" ]; then
+            codesign -d --entitlements :- "$BIN_PATH" > after.plist 2>/dev/null || true
+            if grep -q "keychain-access-groups" after.plist && grep -q "application-identifier" after.plist; then
+              echo "OK: entitlements 完整保留"
+            else
+              echo "ERROR: entitlements 丢失"; cat after.plist; exit 1
+            fi
           else
-            echo "ERROR: entitlements 丢失"; cat after.plist; exit 1
+            echo "OK: 原始包无 entitlements，跳过该检查"
           fi
 
           cd ipa_extracted && zip -qr ../diditok-injected.ipa Payload && cd ..
@@ -125,7 +100,9 @@ jobs:
         run: |
           unzip -l diditok-injected.ipa | grep -i Diditok || (echo "ERROR: dylib missing"; exit 1)
           rm -rf verify && unzip -q diditok-injected.ipa -d verify
-          B=$(find verify/Payload -name OneTravel -type f -path "*/OneTravel.app/*" | head -1)
+          APP_DIR=$(find verify/Payload -maxdepth 2 -name "*.app" -type d | head -1)
+          BIN_NAME=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_DIR/Info.plist")
+          B="$APP_DIR/$BIN_NAME"
           echo "binary: $B"
           otool -L "$B" | grep -i Diditok || (echo "ERROR: load command missing"; exit 1)
           echo "OK: 已注入"

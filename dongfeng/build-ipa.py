@@ -39,6 +39,7 @@ FILES = {
     "build-ipa.py": "dongfeng/build-ipa.py",
     "Sources/DongfengDecoder.swift": "dongfeng/Sources/DongfengDecoder.swift",
     "Sources/AppDelegate.swift": "dongfeng/Sources/AppDelegate.swift",
+    "Sources/HomeViewController.swift": "dongfeng/Sources/HomeViewController.swift",
     "Sources/ScanViewController.swift": "dongfeng/Sources/ScanViewController.swift",
     "SelfTest/main.swift": "dongfeng/SelfTest/main.swift",
     "tools/make-icon.py": "dongfeng/tools/make-icon.py",
@@ -216,7 +217,8 @@ def unpack(zp):
             ("CFBundleIconName", info.get("CFBundleIconName") == "AppIcon"),
             ("Assets.car", car in n and z.getinfo(car).file_size > 1000),
             ("主二进制 arm64", arm64),
-            ("无手动输入控件", b"UITextField" not in exe),
+            ("无手动输入框", b"UITextField" not in exe),
+            ("相册权限文案", bool(info.get("NSPhotoLibraryUsageDescription"))),
         ]
         log("  %s  %.1f KB" % (OUT, os.path.getsize(out) / 1024))
         for k, v in checks:

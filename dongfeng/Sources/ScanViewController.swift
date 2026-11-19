@@ -128,7 +128,7 @@ final class ScanViewController: UIViewController {
         inputField.clearButtonMode = .whileEditing
         inputField.returnKeyType = .go
         inputField.delegate = self
-        inputField.addTarget(self, action: #selector(onCalc), for: .editingDidEndOnEnter)
+        inputField.addTarget(self, action: #selector(onCalc), for: .editingDidEndOnExit)
         inputField.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(inputField)
 
@@ -281,7 +281,7 @@ final class ScanViewController: UIViewController {
             session.addOutput(metadataOutput)
             metadataOutput.setMetadataObjectsDelegate(self, queue: .main)
             var types: [AVMetadataObject.ObjectType] = [.qr]
-            if #available(iOS 15.0, *), metadataOutput.availableMetadataObjectTypes.contains(.microQR) {
+            if #available(iOS 15.4, *), metadataOutput.availableMetadataObjectTypes.contains(.microQR) {
                 types.append(.microQR)
             }
             metadataOutput.metadataObjectTypes = types

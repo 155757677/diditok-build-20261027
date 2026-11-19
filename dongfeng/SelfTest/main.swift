@@ -29,7 +29,7 @@ func check(_ name: String, _ ok: Bool, _ detail: String = "") {
 
 print("phase 1: deriveKey")
 let key = DongfengDecoder.deriveKey(seed: Array(" S73daiqnlsxrqt".utf8), keySize: 32)
-let hex = key.map { String(format: "%02x", $0) }.joined()
+let hex = key.map { String(format: "%02x", Int($0)) }.joined()
 print("       key = \(hex)")
 check("deriveKey == 车机内置派生结果", hex == expectedKeyHex, hex)
 

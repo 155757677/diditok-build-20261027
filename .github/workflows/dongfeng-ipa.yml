@@ -6,12 +6,12 @@ on:
       runner:
         description: 用哪台 macOS 构建机（排队时换一个）
         type: choice
-        default: macos-26
+        default: macos-26-intel
         options:
           - macos-26
           - macos-15
           - macos-26-intel
-          - macos-15-large
+          - macos-15-intel
 
 permissions:
   contents: read

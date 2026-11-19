@@ -165,11 +165,12 @@ enum DongfengDecoder {
 
             var j = 0
             for i in 0..<5 {
+                // Swift 的 UInt8(UInt32) 会做溢出检查（C# 的 (byte) 是截断），必须用 truncatingIfNeeded
                 let k = seed[82 + i]
-                nextBuf[j]     = UInt8(k >> 24)
-                nextBuf[j + 1] = UInt8(k >> 16)
-                nextBuf[j + 2] = UInt8(k >> 8)
-                nextBuf[j + 3] = UInt8(k)
+                nextBuf[j]     = UInt8(truncatingIfNeeded: k >> 24)
+                nextBuf[j + 1] = UInt8(truncatingIfNeeded: k >> 16)
+                nextBuf[j + 2] = UInt8(truncatingIfNeeded: k >> 8)
+                nextBuf[j + 3] = UInt8(truncatingIfNeeded: k)
                 j += 4
             }
             let take = min(20, keySize - next)

@@ -7,7 +7,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         let w = UIWindow(frame: UIScreen.main.bounds)
-        w.rootViewController = ScanViewController()
+        w.rootViewController = HomeViewController()
         w.makeKeyAndVisible()
         window = w
         return true

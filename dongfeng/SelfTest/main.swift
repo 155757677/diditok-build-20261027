@@ -71,7 +71,43 @@ do {
     check("首尾空白", false, "\(error)")
 }
 
-print("phase 6: 负例")
+print("phase 6: 车型串取自二维码（不再硬编码 S73）")
+// 这三组密文是用「别的车型串」派生的密钥加密的，只有正确取用二维码里那段才能解开
+let tagVectors: [(json: String, code: String, pwd: String, tag: String)] = [
+    ("{\"content\":\"NtWgCiBf95Njcu/Bou7HCQ==\\nS09_\",\"encrypt_signal\":\"true\"}", "480295", "6:24;7", "S09_"),
+    ("{\"content\":\"ocCAnBjj/yLydgqF1RWWCQ==\\nS73_EN\",\"encrypt_signal\":\"true\"}", "619084", "83;2:6", "S73_"),
+    ("{\"content\":\"Aqoy0X38Ccp5EGO2yi7fKg==\\n S73\",\"encrypt_signal\":\"true\"}", "362631", "584853", " S73"),
+]
+for v in tagVectors {
+    print("       \(v.json)")
+    do {
+        let r = try DongfengDecoder.compute(v.json)
+        check("车型串 \(v.tag)", r.code == v.code && r.password == v.pwd && r.tag == v.tag,
+              "got \(r.code)/\(r.password)/\"\(r.tag)\"")
+    } catch {
+        check("车型串 \(v.tag)", false, "\(error)")
+    }
+}
+
+print("phase 7: getSecretKey 归一化（补空格 / 截 4 位）")
+let norm: [(raw: String, want: String)] = [
+    ("", " S73"), (" S73", " S73"), ("S73", " S73"), ("S73_EN", "S73_"),
+    ("S09_", "S09_"), ("S09_EN", "S09_"), (" S73 ", " S73"), ("eπ007", "eπ00"),
+]
+for n in norm {
+    let got = DongfengDecoder.normalizedTag(n.raw)
+    check("tag \"\(n.raw)\" → \"\(n.want)\"", got == n.want, "got \"\(got)\"")
+}
+print("phase 8: 补空格后的车型串能解出真样本")
+do {
+    // 车型串少一位时补空格：这条密文用的就是 " S73"
+    let r = try DongfengDecoder.compute("{\"content\":\"Aqoy0X38Ccp5EGO2yi7fKg==\\nS73\",\"encrypt_signal\":\"true\"}")
+    check("S73 补空格后解出真样本", r.code == "362631" && r.password == "584853", "\(r.code)/\(r.password)")
+} catch {
+    check("S73 补空格后解出真样本", false, "\(error)")
+}
+
+print("phase 9: 负例")
 do {
     _ = try DongfengDecoder.compute("")
     check("空输入报错", false, "没抛错")

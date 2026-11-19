@@ -11,24 +11,26 @@ enum DongfengDecoder {
         let code: String
         /// 应输密码（随机码每位 ASCII +2，无回绕）
         let password: String
+        /// 二维码里带的车型串（即密钥 seed 的前缀）
+        let tag: String
     }
 
     enum Error: LocalizedError {
         case empty
         case badBase64
         case badCipherLength
-        case badPkcs5
+        case badPkcs5(tag: String)
         case badPlainLength(String)
         case nonDigit(String)
 
         var errorDescription: String? {
             switch self {
-            case .empty:            return "输入为空"
-            case .badBase64:        return "base64 解析失败"
-            case .badCipherLength:  return "密文长度不是16的倍数"
-            case .badPkcs5:         return "PKCS5 填充异常，密钥或密文不对"
+            case .empty:                return "输入为空"
+            case .badBase64:            return "base64 解析失败"
+            case .badCipherLength:      return "密文长度不是16的倍数"
+            case .badPkcs5(let t):      return "解不出来：车型串 \"\(t)\" 不对或密文被截断"
             case .badPlainLength(let p): return "明文不是6位: [\(p)]"
-            case .nonDigit(let p):  return "明文含非数字: [\(p)]"
+            case .nonDigit(let p):      return "明文含非数字: [\(p)]"
             }
         }
     }
@@ -44,7 +46,10 @@ enum DongfengDecoder {
         }
         s = s.replacingOccurrences(of: "\\n", with: "\n")
              .replacingOccurrences(of: "\\/", with: "/")
+        // content = "<base64>\n<车型串>"：换行前是密文，后面那段就是密钥前缀
+        var tag = ""
         if let nl = s.firstIndex(of: "\n") {
+            tag = String(s[s.index(after: nl)...])
             s = String(s[..<nl])
         }
         s = s.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -53,22 +58,36 @@ enum DongfengDecoder {
         guard let ct = Data(base64Encoded: s, options: []) else { throw Error.badBase64 }
         if ct.isEmpty || ct.count % 16 != 0 { throw Error.badCipherLength }
 
-        let key = deriveKey(seed: Array(" S73daiqnlsxrqt".utf8), keySize: 32)
+        let key = deriveKey(seed: Array(secretKey(seedTag: tag).utf8), keySize: 32)
         guard let pt = aesCBCCrypt(key: key, iv: [UInt8](repeating: 0, count: 16), data: [UInt8](ct), decrypt: true) else {
-            throw Error.badPkcs5
+            throw Error.badPkcs5(tag: tag)
         }
-        guard let last = pt.last else { throw Error.badPkcs5 }
+        guard let last = pt.last else { throw Error.badPkcs5(tag: tag) }
         let pad = Int(last)
-        if pad < 1 || pad > 16 { throw Error.badPkcs5 }
-        if pt.count < pad { throw Error.badPkcs5 }
+        if pad < 1 || pad > 16 { throw Error.badPkcs5(tag: tag) }
+        if pt.count < pad { throw Error.badPkcs5(tag: tag) }
 
         let body = Array(pt[0..<(pt.count - pad)])
-        guard let plain = String(bytes: body, encoding: .ascii) else { throw Error.badPkcs5 }
+        guard let plain = String(bytes: body, encoding: .ascii) else { throw Error.badPkcs5(tag: tag) }
         if plain.count != 6 { throw Error.badPlainLength(plain) }
         if plain.contains(where: { $0 < "0" || $0 > "9" }) { throw Error.badPlainLength(plain) }
 
         let pwd = String(plain.unicodeScalars.map { Character(UnicodeScalar($0.value + 2)!) })
-        return Output(code: plain, password: pwd)
+        return Output(code: plain, password: pwd, tag: normalizedTag(tag))
+    }
+
+    /// 忠实照抄车机 ProductUtils.getSecretKey()：车型串不足 4 位前面补空格、≥4 位取前 4 位，
+    /// 再接内置盐 daiqnlsxrqt。二维码里没带车型串时退回老行为 " S73"。
+    static func secretKey(seedTag: String) -> String {
+        return normalizedTag(seedTag) + "daiqnlsxrqt"
+    }
+
+    static func normalizedTag(_ tag: String) -> String {
+        var t = Substring(tag)
+        while let l = t.last, l == " " || l == "\r" || l == "\n" || l == "\t" { t = t.dropLast() }
+        if t.isEmpty { return " S73" }
+        if t.count >= 4 { return String(t.prefix(4)) }
+        return String(repeating: " ", count: 4 - t.count) + String(t)
     }
 
     private static func firstMatch(_ s: String, pattern: String) -> String? {

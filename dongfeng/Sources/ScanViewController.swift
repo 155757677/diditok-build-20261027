@@ -68,7 +68,7 @@ final class ScanViewController: UIViewController {
         view.addSubview(cameraView)
 
         let preview = AVCaptureVideoPreviewLayer(session: session)
-        preview.videoGravity = .resizeAspectFit
+        preview.videoGravity = .resizeAspectFill   // 铺满中间区域，不留黑边
         cameraView.layer.addSublayer(preview)
         previewLayer = preview
 

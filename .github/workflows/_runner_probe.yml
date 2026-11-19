@@ -1,0 +1,16 @@
+name: Runner Probe (temporary)
+on:
+  workflow_dispatch:
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "linux ok" && uname -a
+  mac:
+    runs-on: macos-14
+    steps:
+      - run: echo "mac ok" && sw_vers && xcodebuild -version
+  mac-latest:
+    runs-on: macos-latest
+    steps:
+      - run: echo "mac-latest ok" && sw_vers

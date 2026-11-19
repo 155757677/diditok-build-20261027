@@ -28,6 +28,8 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>扫描车机工程模式弹窗上的二维码，本机离线算出密码。画面不出设备、不上传。</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>从相册里选一张二维码截图，本机离线算出密码。图片不出设备、不上传。</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UISupportedInterfaceOrientations</key>

@@ -124,7 +124,7 @@ final class HomeViewController: UIViewController {
         resultLabel.text = r.password
         detailLabel.isHidden = true
         detailLabel.text = "随机码 \(r.code) · 车型串 \"\(r.tag)\" · \(source)"
-        hint(.green("点一下数字即复制"))
+        hint("点一下数字即复制", green: true)
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
 
@@ -133,14 +133,14 @@ final class HomeViewController: UIViewController {
         resultLabel.text = "——"
         resultLabel.textColor = .secondaryLabel
         detailLabel.isHidden = true
-        hint(.gray(message))
+        hint(message)
         UINotificationFeedbackGenerator().notificationOccurred(.error)
     }
 
     @objc private func onCopy() {
         guard !password.isEmpty else { return }
         UIPasteboard.general.string = password
-        hint(.green("已复制 \(password)"))
+        hint("已复制 \(password)", green: true)
     }
 
     @objc private func onShowDetail(_ gr: UILongPressGestureRecognizer) {
@@ -198,9 +198,8 @@ final class HomeViewController: UIViewController {
         }
     }
 
-    private enum Tone { case gray, green }
-    private func hint(_ tone: Tone, _ t: String) {
-        hintLabel.textColor = tone == .green ? .systemGreen : .secondaryLabel
+    private func hint(_ t: String, green: Bool = false) {
+        hintLabel.textColor = green ? .systemGreen : .secondaryLabel
         hintLabel.text = t
     }
 }

@@ -2,6 +2,7 @@ import Foundation
 
 // 解码器自检：黄金样本由本地 Python 移植（与 DongfengDecoder.cs 同算法）生成。
 // 打包前先跑这个，证明 Swift 版 SHA1PRNG 派生 / AES-256-CBC / PKCS5 / 每位+2 全部对齐。
+setbuf(stdout, nil)   // 崩溃时也能看到已打印的进度
 
 let expectedKeyHex = "3098af3228f188128290821b1ff61ff2433f416de1efc14aea5597197f188bac"
 
@@ -26,13 +27,15 @@ func check(_ name: String, _ ok: Bool, _ detail: String = "") {
     }
 }
 
-// 1. 密钥派生（32 字节）
+print("phase 1: deriveKey")
 let key = DongfengDecoder.deriveKey(seed: Array(" S73daiqnlsxrqt".utf8), keySize: 32)
 let hex = key.map { String(format: "%02x", $0) }.joined()
+print("       key = \(hex)")
 check("deriveKey == 车机内置派生结果", hex == expectedKeyHex, hex)
 
-// 2. 裸 base64
-for g in golden {
+print("phase 2: base64 x\(golden.count)")
+for (idx, g) in golden.enumerated() {
+    print("       [\(idx)] \(g.ct)")
     do {
         let r = try DongfengDecoder.compute(g.ct)
         check("base64 \(g.code)", r.code == g.code && r.password == g.pwd,
@@ -42,7 +45,7 @@ for g in golden {
     }
 }
 
-// 3. 整段 JSON：content 里是字面反斜杠 + n
+print("phase 3: 整段 JSON（字面 \\n）")
 let json1 = "{\"content\":\"" + golden[1].ct + "\\n S73\",\"encrypt_signal\":\"true\"}"
 do {
     let r = try DongfengDecoder.compute(json1)
@@ -51,7 +54,7 @@ do {
     check("json 字面\\n", false, "\(error)")
 }
 
-// 4. 整段 JSON：content 里是真换行
+print("phase 4: 整段 JSON（真换行）")
 let json2 = "{\"content\":\"" + golden[2].ct + "\n S73\",\"encrypt_signal\":\"true\"}"
 do {
     let r = try DongfengDecoder.compute(json2)
@@ -60,7 +63,7 @@ do {
     check("json 真换行", false, "\(error)")
 }
 
-// 5. 首尾空白
+print("phase 5: 首尾空白")
 do {
     let r = try DongfengDecoder.compute("  \(golden[3].ct)  \n")
     check("首尾空白", r.code == golden[3].code, "\(r.code)")
@@ -68,7 +71,7 @@ do {
     check("首尾空白", false, "\(error)")
 }
 
-// 6. 负例
+print("phase 6: 负例")
 do {
     _ = try DongfengDecoder.compute("")
     check("空输入报错", false, "没抛错")
